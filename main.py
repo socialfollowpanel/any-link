@@ -250,8 +250,11 @@ def looks_like_url(text: str) -> bool:
     return text.startswith(("http://", "https://")) and any(d in text for d in SUPPORTED_DOMAINS)
 
 
-@app.post("/")
-async def webhook(request: Request, background_tasks: BackgroundTasks):
+# ═════════════════════════════════════════════════════════════════════════════
+# Shared update handler (called by both POST / and POST /webhook)
+# ═════════════════════════════════════════════════════════════════════════════
+
+async def _handle_update(request: Request, background_tasks: BackgroundTasks) -> JSONResponse:
     try:
         update = await request.json()
     except Exception:
@@ -261,9 +264,9 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
     if not message:
         return JSONResponse({"ok": True})
 
-    chat_id: int   = message["chat"]["id"]
-    text: str      = (message.get("text") or "").strip()
-    from_user      = message.get("from") or {}
+    chat_id: int    = message["chat"]["id"]
+    text: str       = (message.get("text") or "").strip()
+    from_user       = message.get("from") or {}
     first_name: str = from_user.get("first_name") or "there"
 
     if not text:
@@ -320,17 +323,31 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
         )
         return JSONResponse({"ok": True})
 
-    # Acknowledge immediately so Telegram doesn't retry the webhook
+    # Acknowledge immediately so Telegram doesn't retry
     await send_text(chat_id, "Downloading... ⏳ This may take a moment.")
 
-    # Heavy work in background (Vercel will keep the process alive until done)
+    # Heavy work in background
     background_tasks.add_task(process_url, chat_id, text)
 
     return JSONResponse({"ok": True})
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Health check
+# Routes — accept Telegram updates on both / and /webhook
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.post("/")
+async def webhook_root(request: Request, background_tasks: BackgroundTasks):
+    return await _handle_update(request, background_tasks)
+
+
+@app.post("/webhook")
+async def webhook(request: Request, background_tasks: BackgroundTasks):
+    return await _handle_update(request, background_tasks)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Health check & webhook setup
 # ═════════════════════════════════════════════════════════════════════════════
 
 @app.get("/")
@@ -341,8 +358,10 @@ async def health():
 @app.get("/set_webhook")
 async def set_webhook(url: str):
     """
-    Visit /set_webhook?url=https://your-domain.vercel.app to register webhook.
-    Protect this endpoint in production!
+    Visit /set_webhook?url=https://your-domain.vercel.app/webhook
+    This registers the correct /webhook path with Telegram.
     """
-    result = await tg_send("setWebhook", json={"url": url, "drop_pending_updates": True})
+    # Always point Telegram to the /webhook path
+    webhook_url = url.rstrip("/") + "/webhook"
+    result = await tg_send("setWebhook", json={"url": webhook_url, "drop_pending_updates": True})
     return result
