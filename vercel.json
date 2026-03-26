@@ -16,7 +16,7 @@
     }
   ],
   "env": {
-    "BOT_TOKEN": "8154717141:AAELVgq2wEc9z8b0kb34Y38vP35jh7Ez2vQ"
+    "BOT_TOKEN": ""
   },
   "functions": {
     "main.py": {
