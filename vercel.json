@@ -1,0 +1,26 @@
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "main.py",
+      "use": "@vercel/python",
+      "config": {
+        "maxLambdaSize": "50mb"
+      }
+    }
+  ],
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "main.py"
+    }
+  ],
+  "env": {
+    "BOT_TOKEN": "8154717141:AAELVgq2wEc9z8b0kb34Y38vP35jh7Ez2vQ"
+  },
+  "functions": {
+    "main.py": {
+      "maxDuration": 300
+    }
+  }
+}
