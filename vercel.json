@@ -5,7 +5,8 @@
       "src": "main.py",
       "use": "@vercel/python",
       "config": {
-        "maxLambdaSize": "50mb"
+        "maxLambdaSize": "50mb",
+        "maxDuration": 300
       }
     }
   ],
@@ -14,13 +15,5 @@
       "src": "/(.*)",
       "dest": "main.py"
     }
-  ],
-  "env": {
-    "BOT_TOKEN": ""
-  },
-  "functions": {
-    "main.py": {
-      "maxDuration": 300
-    }
-  }
+  ]
 }
