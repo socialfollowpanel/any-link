@@ -96,7 +96,7 @@ async def send_media_group(chat_id: int, image_paths: list[str]) -> None:
 
 def build_yt_dlp_cmd(url: str, output_template: str) -> list[str]:
     return [
-        "yt-dlp",
+        "python", "-m", "yt_dlp",
         "-f", "bestvideo+bestaudio/best",
         "--merge-output-format", "mp4",
         "--no-playlist",
