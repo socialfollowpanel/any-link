@@ -1,5 +1,7 @@
 import os
+import re
 import glob
+import json
 import asyncio
 import subprocess
 import logging
@@ -10,17 +12,18 @@ import httpx
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 
-# ── Logging ──────────────────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-BOT_TOKEN = os.environ["BOT_TOKEN"]          # set in Vercel env vars
-TG_API    = f"https://api.telegram.org/bot{BOT_TOKEN}"
-TMP_DIR   = "/tmp"
-MAX_BYTES = 50 * 1024 * 1024                 # 50 MB – standard Bot API cap
+BOT_TOKEN  = os.environ["BOT_TOKEN"]
+TG_API     = f"https://api.telegram.org/bot{BOT_TOKEN}"
+TMP_DIR    = "/tmp"
+MAX_BYTES  = 50 * 1024 * 1024          # 50 MB – Telegram Bot API hard cap
+TIKWM_API  = "https://www.tikwm.com/api/"
 
-# ── FastAPI app ───────────────────────────────────────────────────────────────
+# ── App ───────────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
@@ -28,61 +31,74 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # Telegram helpers
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 async def tg_send(method: str, **kwargs) -> dict:
     """Generic async Telegram API call."""
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=90) as client:
         r = await client.post(f"{TG_API}/{method}", **kwargs)
         r.raise_for_status()
         return r.json()
 
 
 async def send_text(chat_id: int, text: str, parse_mode: str = "HTML") -> None:
-    await tg_send("sendMessage", json={"chat_id": chat_id, "text": text, "parse_mode": parse_mode})
+    await tg_send("sendMessage", json={
+        "chat_id": chat_id, "text": text, "parse_mode": parse_mode
+    })
 
 
-async def send_document(chat_id: int, file_path: str, caption: str = "") -> None:
-    """Send any file as a document (no compression)."""
-    with open(file_path, "rb") as f:
+async def send_document(chat_id: int, path: str, caption: str = "") -> None:
+    """Send file as document — Telegram will NOT re-encode it."""
+    with open(path, "rb") as f:
         await tg_send(
             "sendDocument",
-            data={"chat_id": chat_id, "caption": caption},
-            files={"document": (Path(file_path).name, f, "application/octet-stream")},
+            data={"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"},
+            files={"document": (Path(path).name, f, "application/octet-stream")},
         )
 
 
-async def send_photo(chat_id: int, file_path: str) -> None:
-    with open(file_path, "rb") as f:
+async def send_photo(chat_id: int, path: str, caption: str = "") -> None:
+    with open(path, "rb") as f:
         await tg_send(
             "sendPhoto",
-            data={"chat_id": chat_id},
+            data={"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"},
             files={"photo": f},
         )
 
 
-async def send_audio(chat_id: int, file_path: str) -> None:
-    with open(file_path, "rb") as f:
+async def send_audio(chat_id: int, path: str, caption: str = "") -> None:
+    with open(path, "rb") as f:
         await tg_send(
             "sendAudio",
-            data={"chat_id": chat_id},
+            data={"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"},
             files={"audio": f},
         )
 
 
-async def send_media_group(chat_id: int, image_paths: list[str]) -> None:
-    """Send up to 10 images as a media group (carousel)."""
-    # Build the media JSON array
-    media = [{"type": "photo", "media": f"attach://photo{i}"} for i in range(len(image_paths))]
-    files = {}
-    for i, path in enumerate(image_paths[:10]):
+async def send_media_group(
+    chat_id: int,
+    image_paths: list[str],
+    caption: str = "",
+) -> None:
+    """Send up to 10 images as a Telegram media group (carousel)."""
+    batch = image_paths[:10]
+    media = []
+    for i, _ in enumerate(batch):
+        item: dict = {"type": "photo", "media": f"attach://photo{i}"}
+        if i == 0 and caption:
+            item["caption"]    = caption
+            item["parse_mode"] = "HTML"
+        media.append(item)
+
+    files: dict = {}
+    for i, path in enumerate(batch):
         files[f"photo{i}"] = open(path, "rb")
     try:
         await tg_send(
             "sendMediaGroup",
-            data={"chat_id": chat_id, "media": __import__("json").dumps(media)},
+            data={"chat_id": chat_id, "media": json.dumps(media)},
             files=files,
         )
     finally:
@@ -90,9 +106,173 @@ async def send_media_group(chat_id: int, image_paths: list[str]) -> None:
             f.close()
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Download logic
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# TikTok link expansion
+# =============================================================================
+
+TIKTOK_SHORT_DOMAINS = ("vm.tiktok.com", "vt.tiktok.com", "m.tiktok.com")
+
+
+async def expand_tiktok_url(url: str) -> str:
+    """
+    Follow HTTP redirects on short TikTok links so we always work with
+    the canonical URL that contains /video/ or /photo/.
+    """
+    if not any(d in url for d in TIKTOK_SHORT_DOMAINS):
+        return url
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=15,
+            headers={"User-Agent": "Mozilla/5.0"},
+        ) as client:
+            r = await client.head(url)
+            expanded = str(r.url)
+            logger.info("[expand] %s -> %s", url, expanded)
+            return expanded
+    except Exception as exc:
+        logger.warning("[expand] Failed for %s: %s", url, exc)
+        return url
+
+
+def is_tiktok_url(url: str) -> bool:
+    return any(d in url for d in ("tiktok.com", "vm.tiktok.com", "vt.tiktok.com"))
+
+
+def is_tiktok_slideshow(url: str) -> bool:
+    """/photo/ in the canonical URL means slideshow/carousel post."""
+    return "/photo/" in url
+
+
+# =============================================================================
+# tikwm.com API — TikTok slideshow fallback
+# =============================================================================
+
+async def tikwm_fetch(url: str) -> dict:
+    """
+    POST to tikwm.com and return the 'data' payload.
+    Raises RuntimeError on API-level failure.
+    """
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            TIKWM_API,
+            data={"url": url, "hd": 1},
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        r.raise_for_status()
+        body = r.json()
+
+    if body.get("code") != 0:
+        raise RuntimeError(f"tikwm error: {body.get('msg', 'unknown')}")
+
+    return body["data"]
+
+
+async def download_url_to_file(url: str, dest: str) -> str:
+    """Stream-download a single URL to dest. Returns dest path."""
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=60,
+        headers={"User-Agent": "Mozilla/5.0"},
+    ) as client:
+        async with client.stream("GET", url) as r:
+            r.raise_for_status()
+            with open(dest, "wb") as f:
+                async for chunk in r.aiter_bytes(65536):
+                    f.write(chunk)
+    return dest
+
+
+async def handle_tiktok_slideshow(chat_id: int, url: str, prefix: str) -> None:
+    """
+    Full handler for TikTok photo/slideshow posts via tikwm.com.
+
+    Delivery logic:
+      - Images  → sent as media group carousel (batched per 10)
+      - Music   → sent separately as audio message
+    """
+    logger.info("[slideshow] tikwm fetch for %s", url)
+    data = await tikwm_fetch(url)
+
+    # ── Collect image URLs ────────────────────────────────────────────────────
+    images_raw: list[str] = data.get("images") or []
+    if not images_raw:
+        # alternate key structure
+        image_post_info = data.get("image_post_info") or {}
+        for img in image_post_info.get("images", []):
+            url_list = img.get("display_image", {}).get("url_list") or []
+            if url_list:
+                images_raw.append(url_list[0])
+
+    if not images_raw:
+        raise RuntimeError("tikwm returned no images for this slideshow")
+
+    # ── Collect music URL ─────────────────────────────────────────────────────
+    music_url: str = (
+        data.get("music_info", {}).get("play")
+        or data.get("music")
+        or ""
+    )
+
+    # ── Build caption ─────────────────────────────────────────────────────────
+    author  = data.get("author", {}).get("nickname", "")
+    desc    = (data.get("title") or data.get("desc") or "")[:80]
+    caption = f"📸 <b>{author}</b>" + (f"\n{desc}" if desc else "")
+
+    # ── Download all images concurrently ─────────────────────────────────────
+    image_paths: list[str] = []
+    dl_tasks = [
+        download_url_to_file(img_url, f"{TMP_DIR}/{prefix}_slide_{i:02d}.jpg")
+        for i, img_url in enumerate(images_raw)
+    ]
+    results = await asyncio.gather(*dl_tasks, return_exceptions=True)
+
+    for i, res in enumerate(results):
+        p = f"{TMP_DIR}/{prefix}_slide_{i:02d}.jpg"
+        if isinstance(res, Exception):
+            logger.warning("[slideshow] image %d failed: %s", i, res)
+        elif os.path.exists(p) and os.path.getsize(p) > 0:
+            image_paths.append(p)
+
+    if not image_paths:
+        raise RuntimeError("All slideshow images failed to download")
+
+    # ── Download music ────────────────────────────────────────────────────────
+    music_path: str | None = None
+    if music_url:
+        try:
+            mp = f"{TMP_DIR}/{prefix}_music.mp3"
+            await download_url_to_file(music_url, mp)
+            if os.path.exists(mp) and os.path.getsize(mp) > 0:
+                music_path = mp
+        except Exception as exc:
+            logger.warning("[slideshow] music download failed: %s", exc)
+
+    # ── Send images ───────────────────────────────────────────────────────────
+    if len(image_paths) == 1:
+        await send_photo(chat_id, image_paths[0], caption=caption)
+    else:
+        for start in range(0, len(image_paths), 10):
+            batch = image_paths[start : start + 10]
+            await send_media_group(
+                chat_id, batch,
+                caption=caption if start == 0 else "",
+            )
+
+    # ── Send music separately ─────────────────────────────────────────────────
+    if music_path:
+        await send_audio(
+            chat_id, music_path,
+            caption="🎵 <b>Background audio from this slideshow</b>",
+        )
+
+    # ── Cleanup ───────────────────────────────────────────────────────────────
+    cleanup(image_paths + ([music_path] if music_path else []))
+
+
+# =============================================================================
+# yt-dlp helpers
+# =============================================================================
 
 def build_yt_dlp_cmd(url: str, output_template: str) -> list[str]:
     return [
@@ -107,32 +287,44 @@ def build_yt_dlp_cmd(url: str, output_template: str) -> list[str]:
     ]
 
 
-def download_media(url: str, chat_id: int) -> list[str]:
-    """
-    Run yt-dlp and return list of downloaded file paths.
-    Raises subprocess.CalledProcessError on failure.
-    """
-    # Use chat_id+url hash as prefix so concurrent downloads don't collide
-    prefix = f"{chat_id}_{abs(hash(url))}"
+def run_yt_dlp(url: str, prefix: str) -> list[str]:
+    """Download via yt-dlp. Returns list of output file paths."""
     output_template = f"{TMP_DIR}/{prefix}_%(id)s.%(ext)s"
-
     cmd = build_yt_dlp_cmd(url, output_template)
-    logger.info("Running: %s", " ".join(cmd))
+    logger.info("[yt-dlp] %s", " ".join(cmd))
 
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=240,       # 4-minute hard cap; adjust to your worker limits
-    )
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
 
     if result.returncode != 0:
-        logger.error("yt-dlp stderr: %s", result.stderr)
+        logger.error("[yt-dlp] stderr: %s", result.stderr)
         raise RuntimeError(result.stderr or "yt-dlp exited with error")
 
-    # Collect files that match our prefix
-    files = sorted(glob.glob(f"{TMP_DIR}/{prefix}_*"))
-    return files
+    return sorted(glob.glob(f"{TMP_DIR}/{prefix}_*"))
+
+
+def extract_audio_from_video(video_path: str, prefix: str) -> str | None:
+    """
+    Extract the audio track from a video file as mp3.
+    Returns the mp3 file path, or None if extraction fails.
+    """
+    out_template = f"{TMP_DIR}/{prefix}_audio.%(ext)s"
+    cmd = [
+        "python", "-m", "yt_dlp",
+        "--no-warnings",
+        "-x",
+        "--audio-format", "mp3",
+        "--audio-quality", "0",
+        "-o", out_template,
+        video_path,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        candidates = glob.glob(f"{TMP_DIR}/{prefix}_audio*.mp3")
+        if candidates and os.path.getsize(candidates[0]) > 0:
+            return candidates[0]
+    except Exception as exc:
+        logger.warning("[audio-extract] Failed: %s", exc)
+    return None
 
 
 def classify_file(path: str) -> str:
@@ -154,85 +346,138 @@ def cleanup(paths: list[str]) -> None:
             pass
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Core worker
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# Master process_url dispatcher
+# =============================================================================
 
 async def process_url(chat_id: int, url: str) -> None:
-    files: list[str] = []
-    try:
-        # 1. Download
-        loop = asyncio.get_event_loop()
-        files = await loop.run_in_executor(None, download_media, url, chat_id)
+    all_files: list[str] = []
+    prefix = f"{chat_id}_{abs(hash(url))}"
 
-        if not files:
-            await send_text(chat_id, "Failed to download this content 😢\nNo media was found at that URL.")
+    try:
+        # ── 1. Expand short TikTok links ──────────────────────────────────────
+        if is_tiktok_url(url):
+            url = await expand_tiktok_url(url)
+
+        # ── 2. TikTok slideshow detected → tikwm directly ─────────────────────
+        if is_tiktok_url(url) and is_tiktok_slideshow(url):
+            logger.info("[dispatch] TikTok slideshow → tikwm")
+            await handle_tiktok_slideshow(chat_id, url, prefix)
             return
 
-        # 2. Check sizes
-        oversized = [f for f in files if os.path.getsize(f) > MAX_BYTES]
-        sendable  = [f for f in files if os.path.getsize(f) <= MAX_BYTES]
+        # ── 3. yt-dlp for all other URLs ─────────────────────────────────────
+        loop = asyncio.get_event_loop()
+        try:
+            files = await loop.run_in_executor(None, run_yt_dlp, url, prefix)
+        except RuntimeError as exc:
+            err = str(exc)
 
-        # Warn about oversized files
-        if oversized:
-            names = ", ".join(Path(f).name for f in oversized)
+            # yt-dlp can't handle it and it's TikTok → tikwm fallback
+            if is_tiktok_url(url) and (
+                "Unsupported URL" in err
+                or "unsupported url" in err.lower()
+            ):
+                logger.info("[dispatch] yt-dlp unsupported → tikwm fallback")
+                await handle_tiktok_slideshow(chat_id, url, prefix)
+                return
+
+            if "private" in err.lower() or "login" in err.lower():
+                await send_text(chat_id, "This content is private or requires login 🔒")
+            else:
+                await send_text(
+                    chat_id,
+                    "Failed to download this content 😢\n"
+                    "Make sure the link is public and try again."
+                )
+            return
+
+        all_files = list(files)
+
+        if not all_files:
             await send_text(
                 chat_id,
-                f"⚠️ {len(oversized)} file(s) exceed the 50 MB Telegram limit and were skipped:\n{names}"
+                "Failed to download this content 😢\nNo media found at that URL."
             )
+            return
 
+        # ── 4. Size filter ────────────────────────────────────────────────────
+        oversized = [f for f in all_files if os.path.getsize(f) > MAX_BYTES]
+        sendable  = [f for f in all_files if os.path.getsize(f) <= MAX_BYTES]
+
+        if oversized:
+            await send_text(
+                chat_id,
+                f"⚠️ <b>{len(oversized)}</b> file(s) exceeded the 50 MB Telegram limit and were skipped."
+            )
         if not sendable:
             await send_text(chat_id, "All downloaded files exceed Telegram's 50 MB limit 😢")
             return
 
-        # 3. Dispatch by type
+        # ── 5. Classify files ─────────────────────────────────────────────────
         photos = [f for f in sendable if classify_file(f) == "photo"]
         videos = [f for f in sendable if classify_file(f) == "video"]
         audios = [f for f in sendable if classify_file(f) == "audio"]
         docs   = [f for f in sendable if classify_file(f) == "document"]
 
-        # Photos → media group if plural, single photo otherwise
+        # ── 6. Photos ─────────────────────────────────────────────────────────
         if len(photos) > 1:
-            await send_media_group(chat_id, photos)
+            for start in range(0, len(photos), 10):
+                await send_media_group(chat_id, photos[start : start + 10])
         elif photos:
             await send_photo(chat_id, photos[0])
 
-        # Videos sent as document to prevent Telegram re-encoding
+        # ── 7. Videos → document (no compression) + extracted audio ──────────
         for vf in videos:
-            await send_document(chat_id, vf, caption="🎬 Highest quality – no compression")
+            # Send video file — sendDocument prevents Telegram re-encoding
+            await send_document(
+                chat_id, vf,
+                caption="🎬 <b>Video</b> — original quality, no compression"
+            )
+            # Extract and send audio track separately
+            audio_path = await loop.run_in_executor(
+                None, extract_audio_from_video, vf, prefix
+            )
+            if audio_path:
+                all_files.append(audio_path)
+                if os.path.getsize(audio_path) <= MAX_BYTES:
+                    await send_audio(
+                        chat_id, audio_path,
+                        caption="🎵 <b>Audio track extracted from video</b>"
+                    )
 
+        # ── 8. Standalone audio files ─────────────────────────────────────────
         for af in audios:
             await send_audio(chat_id, af)
 
+        # ── 9. Other documents ────────────────────────────────────────────────
         for df in docs:
             await send_document(chat_id, df)
 
+    except asyncio.TimeoutError:
+        logger.exception("[process] Timeout for %s", url)
+        await send_text(
+            chat_id,
+            "Download timed out ⏱️\nThe file may be too large or the platform is slow."
+        )
     except subprocess.TimeoutExpired:
-        logger.exception("yt-dlp timed out for %s", url)
-        await send_text(chat_id, "Download timed out ⏱️\nThe media may be too large or the platform is slow.")
-
-    except RuntimeError as exc:
-        logger.exception("yt-dlp error for %s", url)
-        msg = str(exc)
-        if "Private" in msg or "private" in msg or "login" in msg.lower():
-            await send_text(chat_id, "This content is private or requires login 🔒")
-        else:
-            await send_text(chat_id, "Failed to download this content 😢")
-
+        logger.exception("[process] yt-dlp timeout for %s", url)
+        await send_text(
+            chat_id,
+            "Download timed out ⏱️\nThe file may be too large or the platform is slow."
+        )
     except Exception:
-        logger.exception("Unexpected error for %s", url)
-        await send_text(chat_id, "An unexpected error occurred 😢")
-
+        logger.exception("[process] Unexpected error for %s", url)
+        await send_text(chat_id, "An unexpected error occurred 😢\nPlease try again.")
     finally:
-        cleanup(files)
+        cleanup(all_files)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Webhook endpoint
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# Supported domains
+# =============================================================================
 
 SUPPORTED_DOMAINS = (
-    "tiktok.com", "vm.tiktok.com",
+    "tiktok.com", "vm.tiktok.com", "vt.tiktok.com",
     "instagram.com", "instagr.am",
     "youtube.com", "youtu.be",
     "twitter.com", "x.com", "t.co",
@@ -247,14 +492,20 @@ SUPPORTED_DOMAINS = (
 
 def looks_like_url(text: str) -> bool:
     text = text.strip()
-    return text.startswith(("http://", "https://")) and any(d in text for d in SUPPORTED_DOMAINS)
+    return (
+        text.startswith(("http://", "https://"))
+        and any(d in text for d in SUPPORTED_DOMAINS)
+    )
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Shared update handler (called by both POST / and POST /webhook)
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# Telegram update handler (shared by all routes)
+# =============================================================================
 
-async def _handle_update(request: Request, background_tasks: BackgroundTasks) -> JSONResponse:
+async def _handle_update(
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> JSONResponse:
     try:
         update = await request.json()
     except Exception:
@@ -272,13 +523,13 @@ async def _handle_update(request: Request, background_tasks: BackgroundTasks) ->
     if not text:
         return JSONResponse({"ok": True})
 
-    # ── Commands ──────────────────────────────────────────────────────────────
+    # ── /start ────────────────────────────────────────────────────────────────
     if text.startswith("/start"):
-        welcome = (
+        await send_text(chat_id, (
             f"👋 <b>Hey {first_name}, welcome to Universal Downloader Bot!</b>\n\n"
-            "I can download media from any of these platforms and send it back "
-            "to you in the <b>highest available quality</b> — no compression.\n\n"
-            "🎬 <b>TikTok</b>\n"
+            "I download media from any platform and deliver it in the "
+            "<b>highest available quality</b> — no compression, ever.\n\n"
+            "🎬 <b>TikTok</b> — Videos, Slideshows &amp; Carousels\n"
             "📸 <b>Instagram</b> — Reels, Posts, Carousels\n"
             "▶️ <b>YouTube</b>\n"
             "🐦 <b>Twitter / X</b>\n"
@@ -288,53 +539,56 @@ async def _handle_update(request: Request, background_tasks: BackgroundTasks) ->
             "🎞 <b>Vimeo</b> — and more!\n\n"
             "━━━━━━━━━━━━━━━━\n"
             "📌 <b>How to use:</b>\n"
-            "1. Copy a media link from any supported platform.\n"
-            "2. Paste it here and hit send.\n"
-            "3. I'll download and deliver it right back! ⚡\n\n"
-            "Need help? Just type /help"
-        )
-        await send_text(chat_id, welcome)
+            "1. Copy a link from any supported platform.\n"
+            "2. Paste it here and send.\n"
+            "3. I'll download and deliver it instantly! ⚡\n\n"
+            "Type /help for detailed info."
+        ))
         return JSONResponse({"ok": True})
 
+    # ── /help ─────────────────────────────────────────────────────────────────
     if text.startswith("/help"):
-        help_msg = (
-            "📖 <b>How to use Universal Downloader Bot</b>\n\n"
+        await send_text(chat_id, (
+            "📖 <b>Universal Downloader Bot — Help</b>\n\n"
             "<b>Step 1:</b> Copy a media URL from a supported platform.\n"
-            "<b>Step 2:</b> Paste it here.\n"
-            "<b>Step 3:</b> Wait a moment — I'll download and send it back!\n\n"
+            "<b>Step 2:</b> Paste it here and send.\n"
+            "<b>Step 3:</b> Wait a moment — I'll send it right back!\n\n"
             "━━━━━━━━━━━━━━━━\n"
             "✅ <b>Supported platforms:</b>\n"
             "TikTok · Instagram · YouTube · Twitter/X\n"
             "Facebook · Reddit · Vimeo · Twitch · Pinterest · Snapchat\n\n"
             "━━━━━━━━━━━━━━━━\n"
+            "📦 <b>What you receive:</b>\n"
+            "• <b>Videos</b> → sent as document (no Telegram compression)\n"
+            "  + audio track extracted &amp; sent separately 🎵\n"
+            "• <b>TikTok Slideshows</b> → all photos as carousel\n"
+            "  + background music sent separately 🎵\n"
+            "• <b>Photos</b> → single photo or carousel\n\n"
+            "━━━━━━━━━━━━━━━━\n"
             "⚠️ <b>Limitations:</b>\n"
             "• Files above 50 MB cannot be sent via Telegram.\n"
-            "• Private or login-protected content cannot be downloaded.\n\n"
-            "If something fails, make sure the link is public and try again! 🔁"
-        )
-        await send_text(chat_id, help_msg)
+            "• Private or login-protected content cannot be downloaded."
+        ))
         return JSONResponse({"ok": True})
 
+    # ── URL check ─────────────────────────────────────────────────────────────
     if not looks_like_url(text):
-        await send_text(
-            chat_id,
+        await send_text(chat_id, (
             "⚠️ Please send a valid URL from a supported platform.\n"
-            "Use /help to see the list of supported platforms.",
-        )
+            "Type /help to see the full list."
+        ))
         return JSONResponse({"ok": True})
 
-    # Acknowledge immediately so Telegram doesn't retry
+    # ── Queue download ────────────────────────────────────────────────────────
     await send_text(chat_id, "Downloading... ⏳ This may take a moment.")
-
-    # Heavy work in background
     background_tasks.add_task(process_url, chat_id, text)
 
     return JSONResponse({"ok": True})
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Routes — accept Telegram updates on both / and /webhook
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# Routes
+# =============================================================================
 
 @app.post("/")
 async def webhook_root(request: Request, background_tasks: BackgroundTasks):
@@ -346,10 +600,6 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
     return await _handle_update(request, background_tasks)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Health check & webhook setup
-# ═════════════════════════════════════════════════════════════════════════════
-
 @app.get("/")
 async def health():
     return {"status": "ok", "bot": "Universal Telegram Downloader"}
@@ -357,11 +607,9 @@ async def health():
 
 @app.get("/set_webhook")
 async def set_webhook(url: str):
-    """
-    Visit /set_webhook?url=https://your-domain.vercel.app/webhook
-    This registers the correct /webhook path with Telegram.
-    """
-    # Always point Telegram to the /webhook path
+    """Visit /set_webhook?url=https://your-domain.vercel.app"""
     webhook_url = url.rstrip("/") + "/webhook"
-    result = await tg_send("setWebhook", json={"url": webhook_url, "drop_pending_updates": True})
-    return result
+    return await tg_send(
+        "setWebhook",
+        json={"url": webhook_url, "drop_pending_updates": True},
+    )
