@@ -43,10 +43,30 @@ async def tg_send(method: str, **kwargs) -> dict:
         return r.json()
 
 
-async def send_text(chat_id: int, text: str, parse_mode: str = "HTML") -> None:
-    await tg_send("sendMessage", json={
+async def send_text(chat_id: int, text: str, parse_mode: str = "HTML") -> dict:
+    """Send text and return the response (useful for getting message_id)."""
+    return await tg_send("sendMessage", json={
         "chat_id": chat_id, "text": text, "parse_mode": parse_mode
     })
+
+
+async def edit_message_text(chat_id: int, message_id: int, text: str, parse_mode: str = "HTML") -> None:
+    """Edit an existing message to create a loading 'animation'."""
+    try:
+        await tg_send("editMessageText", json={
+            "chat_id": chat_id, "message_id": message_id, 
+            "text": text, "parse_mode": parse_mode
+        })
+    except Exception as e:
+        logger.warning(f"[tg_edit] Failed to edit message: {e}")
+
+
+async def delete_message(chat_id: int, message_id: int) -> None:
+    """Delete the loading message once done."""
+    try:
+        await tg_send("deleteMessage", json={"chat_id": chat_id, "message_id": message_id})
+    except Exception:
+        pass
 
 
 async def send_document(chat_id: int, path: str, caption: str = "") -> None:
@@ -107,17 +127,27 @@ async def send_media_group(
 
 
 # =============================================================================
-# TikTok link expansion
+# URL Detection & Expansion
 # =============================================================================
 
 TIKTOK_SHORT_DOMAINS = ("vm.tiktok.com", "vt.tiktok.com", "m.tiktok.com")
 
+def is_tiktok_url(url: str) -> bool:
+    return any(d in url for d in ("tiktok.com", "vm.tiktok.com", "vt.tiktok.com"))
+
+def is_tiktok_slideshow(url: str) -> bool:
+    return "/photo/" in url
+
+def is_instagram_url(url: str) -> bool:
+    return any(d in url for d in ("instagram.com", "instagr.am"))
+
+def is_facebook_url(url: str) -> bool:
+    return any(d in url for d in ("facebook.com", "fb.watch", "fb.com"))
+
+def is_youtube_url(url: str) -> bool:
+    return any(d in url for d in ("youtube.com", "youtu.be"))
 
 async def expand_tiktok_url(url: str) -> str:
-    """
-    Follow HTTP redirects on short TikTok links so we always work with
-    the canonical URL that contains /video/ or /photo/.
-    """
     if not any(d in url for d in TIKTOK_SHORT_DOMAINS):
         return url
     try:
@@ -135,38 +165,9 @@ async def expand_tiktok_url(url: str) -> str:
         return url
 
 
-def is_tiktok_url(url: str) -> bool:
-    return any(d in url for d in ("tiktok.com", "vm.tiktok.com", "vt.tiktok.com"))
-
-
-def is_tiktok_slideshow(url: str) -> bool:
-    """/photo/ in the canonical URL means slideshow/carousel post."""
-    return "/photo/" in url
-
-
 # =============================================================================
-# tikwm.com API — TikTok slideshow fallback
+# Downloader Core & Fallback APIs
 # =============================================================================
-
-async def tikwm_fetch(url: str) -> dict:
-    """
-    POST to tikwm.com and return the 'data' payload.
-    Raises RuntimeError on API-level failure.
-    """
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(
-            TIKWM_API,
-            data={"url": url, "hd": 1},
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
-        r.raise_for_status()
-        body = r.json()
-
-    if body.get("code") != 0:
-        raise RuntimeError(f"tikwm error: {body.get('msg', 'unknown')}")
-
-    return body["data"]
-
 
 async def download_url_to_file(url: str, dest: str) -> str:
     """Stream-download a single URL to dest. Returns dest path."""
@@ -183,91 +184,123 @@ async def download_url_to_file(url: str, dest: str) -> str:
     return dest
 
 
-async def handle_tiktok_slideshow(chat_id: int, url: str, prefix: str) -> None:
-    """
-    Full handler for TikTok photo/slideshow posts via tikwm.com.
+# ── TikTok Fallback API (tikwm) ──
+async def tikwm_fetch(url: str) -> dict:
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            TIKWM_API,
+            data={"url": url, "hd": 1},
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        r.raise_for_status()
+        body = r.json()
 
-    Delivery logic:
-      - Images  → sent as media group carousel (batched per 10)
-      - Music   → sent separately as audio message
-    """
-    logger.info("[slideshow] tikwm fetch for %s", url)
+    if body.get("code") != 0:
+        raise RuntimeError(f"tikwm error: {body.get('msg', 'unknown')}")
+
+    return body["data"]
+
+async def handle_tiktok_fallback(chat_id: int, url: str, prefix: str) -> list[str]:
+    """Handles both TikTok videos and slideshows via tikwm."""
+    logger.info("[fallback] tikwm fetch for %s", url)
     data = await tikwm_fetch(url)
-
-    # ── Collect image URLs ────────────────────────────────────────────────────
+    
+    # Check if it's a slideshow
     images_raw: list[str] = data.get("images") or []
     if not images_raw:
-        # alternate key structure
         image_post_info = data.get("image_post_info") or {}
         for img in image_post_info.get("images", []):
             url_list = img.get("display_image", {}).get("url_list") or []
             if url_list:
                 images_raw.append(url_list[0])
 
-    if not images_raw:
-        raise RuntimeError("tikwm returned no images for this slideshow")
-
-    # ── Collect music URL ─────────────────────────────────────────────────────
-    music_url: str = (
-        data.get("music_info", {}).get("play")
-        or data.get("music")
-        or ""
-    )
-
-    # ── Build caption ─────────────────────────────────────────────────────────
-    author  = data.get("author", {}).get("nickname", "")
-    desc    = (data.get("title") or data.get("desc") or "")[:80]
-    caption = f"📸 <b>{author}</b>" + (f"\n{desc}" if desc else "")
-
-    # ── Download all images concurrently ─────────────────────────────────────
-    image_paths: list[str] = []
-    dl_tasks = [
-        download_url_to_file(img_url, f"{TMP_DIR}/{prefix}_slide_{i:02d}.jpg")
-        for i, img_url in enumerate(images_raw)
-    ]
-    results = await asyncio.gather(*dl_tasks, return_exceptions=True)
-
-    for i, res in enumerate(results):
-        p = f"{TMP_DIR}/{prefix}_slide_{i:02d}.jpg"
-        if isinstance(res, Exception):
-            logger.warning("[slideshow] image %d failed: %s", i, res)
-        elif os.path.exists(p) and os.path.getsize(p) > 0:
-            image_paths.append(p)
-
-    if not image_paths:
-        raise RuntimeError("All slideshow images failed to download")
-
-    # ── Download music ────────────────────────────────────────────────────────
-    music_path: str | None = None
-    if music_url:
-        try:
+    if images_raw:
+        # It's a slideshow
+        image_paths: list[str] = []
+        dl_tasks = [
+            download_url_to_file(img_url, f"{TMP_DIR}/{prefix}_slide_{i:02d}.jpg")
+            for i, img_url in enumerate(images_raw)
+        ]
+        results = await asyncio.gather(*dl_tasks, return_exceptions=True)
+        for i, res in enumerate(results):
+            p = f"{TMP_DIR}/{prefix}_slide_{i:02d}.jpg"
+            if not isinstance(res, Exception) and os.path.exists(p) and os.path.getsize(p) > 0:
+                image_paths.append(p)
+                
+        # Get music
+        music_url = data.get("music_info", {}).get("play") or data.get("music") or ""
+        if music_url:
             mp = f"{TMP_DIR}/{prefix}_music.mp3"
-            await download_url_to_file(music_url, mp)
-            if os.path.exists(mp) and os.path.getsize(mp) > 0:
-                music_path = mp
-        except Exception as exc:
-            logger.warning("[slideshow] music download failed: %s", exc)
-
-    # ── Send images ───────────────────────────────────────────────────────────
-    if len(image_paths) == 1:
-        await send_photo(chat_id, image_paths[0], caption=caption)
+            try:
+                await download_url_to_file(music_url, mp)
+                if os.path.exists(mp): image_paths.append(mp)
+            except Exception:
+                pass
+        return image_paths
     else:
-        for start in range(0, len(image_paths), 10):
-            batch = image_paths[start : start + 10]
-            await send_media_group(
-                chat_id, batch,
-                caption=caption if start == 0 else "",
-            )
+        # It's a standard video
+        play_url = data.get("play") or data.get("wmplay")
+        if not play_url:
+            raise RuntimeError("tikwm returned no video URL")
+        dest = f"{TMP_DIR}/{prefix}_tiktok.mp4"
+        await download_url_to_file(play_url, dest)
+        return [dest]
 
-    # ── Send music separately ─────────────────────────────────────────────────
-    if music_path:
-        await send_audio(
-            chat_id, music_path,
-            caption="🎵 <b>Background audio from this slideshow</b>",
-        )
 
-    # ── Cleanup ───────────────────────────────────────────────────────────────
-    cleanup(image_paths + ([music_path] if music_path else []))
+# ── Universal Fallback API (Cobalt) for IG, FB, YT ──
+async def universal_platform_fallback(url: str, prefix: str) -> list[str]:
+    """
+    Uses the Cobalt API as a fallback for Instagram (Reels/Posts/Carousels), 
+    Facebook, and YouTube to guarantee highest quality delivery.
+    """
+    logger.info("[fallback] universal API fetch for %s", url)
+    api_url = "https://api.cobalt.tools/api/json"
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    }
+    payload = {
+        "url": url,
+        "vQuality": "max",
+        "filenamePattern": "basic"
+    }
+    
+    async with httpx.AsyncClient(timeout=45) as client:
+        r = await client.post(api_url, json=payload, headers=headers)
+        r.raise_for_status()
+        data = r.json()
+
+    if data.get("status") == "error":
+        raise RuntimeError(data.get("text", "Fallback API returned an error"))
+
+    paths = []
+    
+    # Handle Carousels / Multiple items (Instagram posts with multiple slides)
+    if data.get("status") == "picker":
+        items = data.get("picker", [])
+        dl_tasks = []
+        for i, item in enumerate(items):
+            item_url = item.get("url")
+            if item_url:
+                ext = "mp4" if item.get("type") == "video" else "jpg"
+                dest = f"{TMP_DIR}/{prefix}_fallback_{i:02d}.{ext}"
+                dl_tasks.append(download_url_to_file(item_url, dest))
+        
+        results = await asyncio.gather(*dl_tasks, return_exceptions=True)
+        for res in results:
+            if not isinstance(res, Exception):
+                paths.append(res)
+    else:
+        # Single Video/Audio/Photo
+        url_to_download = data.get("url")
+        if not url_to_download:
+            raise RuntimeError("No media URL returned from fallback")
+        dest = f"{TMP_DIR}/{prefix}_fallback.mp4"
+        await download_url_to_file(url_to_download, dest)
+        paths.append(dest)
+
+    return paths
 
 
 # =============================================================================
@@ -275,16 +308,20 @@ async def handle_tiktok_slideshow(chat_id: int, url: str, prefix: str) -> None:
 # =============================================================================
 
 def build_yt_dlp_cmd(url: str, output_template: str) -> list[str]:
-    return [
+    cmd = [
         "python", "-m", "yt_dlp",
         "-f", "bestvideo+bestaudio/best",
         "--merge-output-format", "mp4",
         "--no-playlist",
         "--no-warnings",
         "--socket-timeout", "30",
-        "-o", output_template,
-        url,
     ]
+    # Always pass cookies if the file exists (crucial for Instagram & age-restricted YT)
+    if os.path.exists("cookies.txt"):
+        cmd.extend(["--cookies", "cookies.txt"])
+        
+    cmd.extend(["-o", output_template, url])
+    return cmd
 
 
 def run_yt_dlp(url: str, prefix: str) -> list[str]:
@@ -303,10 +340,7 @@ def run_yt_dlp(url: str, prefix: str) -> list[str]:
 
 
 def extract_audio_from_video(video_path: str, prefix: str) -> str | None:
-    """
-    Extract the audio track from a video file as mp3.
-    Returns the mp3 file path, or None if extraction fails.
-    """
+    """Extract the audio track from a video file as mp3."""
     out_template = f"{TMP_DIR}/{prefix}_audio.%(ext)s"
     cmd = [
         "python", "-m", "yt_dlp",
@@ -318,7 +352,7 @@ def extract_audio_from_video(video_path: str, prefix: str) -> str | None:
         video_path,
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         candidates = glob.glob(f"{TMP_DIR}/{prefix}_audio*.mp3")
         if candidates and os.path.getsize(candidates[0]) > 0:
             return candidates[0]
@@ -350,54 +384,52 @@ def cleanup(paths: list[str]) -> None:
 # Master process_url dispatcher
 # =============================================================================
 
-async def process_url(chat_id: int, url: str) -> None:
+async def process_url(chat_id: int, msg_id: int, url: str) -> None:
     all_files: list[str] = []
     prefix = f"{chat_id}_{abs(hash(url))}"
 
     try:
         # ── 1. Expand short TikTok links ──────────────────────────────────────
+        await edit_message_text(chat_id, msg_id, "🔍 <b>Analyzing URL...</b>")
         if is_tiktok_url(url):
             url = await expand_tiktok_url(url)
 
-        # ── 2. TikTok slideshow detected → tikwm directly ─────────────────────
-        if is_tiktok_url(url) and is_tiktok_slideshow(url):
-            logger.info("[dispatch] TikTok slideshow → tikwm")
-            await handle_tiktok_slideshow(chat_id, url, prefix)
-            return
-
-        # ── 3. yt-dlp for all other URLs ─────────────────────────────────────
+        # ── 2. Primary Downloader: yt-dlp ─────────────────────────────────────
         loop = asyncio.get_event_loop()
+        await edit_message_text(chat_id, msg_id, "📥 <b>Downloading media in highest quality...</b>")
+        
         try:
+            # Enforce slideshows directly to fallback since yt-dlp handles carousels poorly
+            if is_tiktok_url(url) and is_tiktok_slideshow(url):
+                raise RuntimeError("TikTok Slideshow bypassed yt-dlp")
+                
             files = await loop.run_in_executor(None, run_yt_dlp, url, prefix)
+            all_files = list(files)
+            
         except RuntimeError as exc:
-            err = str(exc)
-
-            # yt-dlp can't handle it and it's TikTok → tikwm fallback
-            if is_tiktok_url(url) and (
-                "Unsupported URL" in err
-                or "unsupported url" in err.lower()
-            ):
-                logger.info("[dispatch] yt-dlp unsupported → tikwm fallback")
-                await handle_tiktok_slideshow(chat_id, url, prefix)
+            err = str(exc).lower()
+            logger.info(f"[dispatch] yt-dlp failed: {err}")
+            await edit_message_text(chat_id, msg_id, "⚠️ <b>yt-dlp failed, trying platform-specific fallback...</b>")
+            
+            # ── 3. Hybrid Fallback Routing ────────────────────────────────────
+            try:
+                if is_tiktok_url(url):
+                    all_files = await handle_tiktok_fallback(chat_id, url, prefix)
+                elif is_instagram_url(url) or is_facebook_url(url) or is_youtube_url(url):
+                    all_files = await universal_platform_fallback(url, prefix)
+                else:
+                    if "private" in err or "login" in err:
+                        await edit_message_text(chat_id, msg_id, "🔒 <b>This content is private or requires login.</b>")
+                    else:
+                        await edit_message_text(chat_id, msg_id, "😢 <b>Failed to download this content. Make sure the link is public.</b>")
+                    return
+            except Exception as fallback_exc:
+                logger.error(f"[fallback] API failed: {fallback_exc}")
+                await edit_message_text(chat_id, msg_id, "😢 <b>All download methods failed for this link.</b>")
                 return
 
-            if "private" in err.lower() or "login" in err.lower():
-                await send_text(chat_id, "This content is private or requires login 🔒")
-            else:
-                await send_text(
-                    chat_id,
-                    "Failed to download this content 😢\n"
-                    "Make sure the link is public and try again."
-                )
-            return
-
-        all_files = list(files)
-
         if not all_files:
-            await send_text(
-                chat_id,
-                "Failed to download this content 😢\nNo media found at that URL."
-            )
+            await edit_message_text(chat_id, msg_id, "😢 <b>Failed to download this content. No media found.</b>")
             return
 
         # ── 4. Size filter ────────────────────────────────────────────────────
@@ -410,7 +442,7 @@ async def process_url(chat_id: int, url: str) -> None:
                 f"⚠️ <b>{len(oversized)}</b> file(s) exceeded the 50 MB Telegram limit and were skipped."
             )
         if not sendable:
-            await send_text(chat_id, "All downloaded files exceed Telegram's 50 MB limit 😢")
+            await edit_message_text(chat_id, msg_id, "😢 <b>All downloaded files exceed Telegram's 50 MB limit.</b>")
             return
 
         # ── 5. Classify files ─────────────────────────────────────────────────
@@ -419,7 +451,9 @@ async def process_url(chat_id: int, url: str) -> None:
         audios = [f for f in sendable if classify_file(f) == "audio"]
         docs   = [f for f in sendable if classify_file(f) == "document"]
 
-        # ── 6. Photos ─────────────────────────────────────────────────────────
+        await edit_message_text(chat_id, msg_id, "📤 <b>Uploading to Telegram...</b>")
+
+        # ── 6. Photos (Carousels handled perfectly here) ──────────────────────
         if len(photos) > 1:
             for start in range(0, len(photos), 10):
                 await send_media_group(chat_id, photos[start : start + 10])
@@ -445,29 +479,26 @@ async def process_url(chat_id: int, url: str) -> None:
                         caption="🎵 <b>Audio track extracted from video</b>"
                     )
 
-        # ── 8. Standalone audio files ─────────────────────────────────────────
+        # ── 8. Standalone audio files (Background music for carousels) ────────
         for af in audios:
             await send_audio(chat_id, af)
 
         # ── 9. Other documents ────────────────────────────────────────────────
         for df in docs:
             await send_document(chat_id, df)
+            
+        # Cleanup loading message on success
+        await delete_message(chat_id, msg_id)
 
     except asyncio.TimeoutError:
         logger.exception("[process] Timeout for %s", url)
-        await send_text(
-            chat_id,
-            "Download timed out ⏱️\nThe file may be too large or the platform is slow."
-        )
+        await edit_message_text(chat_id, msg_id, "⏱️ <b>Download timed out.\nThe file may be too large or the platform is slow.</b>")
     except subprocess.TimeoutExpired:
         logger.exception("[process] yt-dlp timeout for %s", url)
-        await send_text(
-            chat_id,
-            "Download timed out ⏱️\nThe file may be too large or the platform is slow."
-        )
+        await edit_message_text(chat_id, msg_id, "⏱️ <b>Download timed out.\nThe file may be too large or the platform is slow.</b>")
     except Exception:
         logger.exception("[process] Unexpected error for %s", url)
-        await send_text(chat_id, "An unexpected error occurred 😢\nPlease try again.")
+        await edit_message_text(chat_id, msg_id, "😢 <b>An unexpected error occurred.\nPlease try again.</b>")
     finally:
         cleanup(all_files)
 
@@ -481,7 +512,7 @@ SUPPORTED_DOMAINS = (
     "instagram.com", "instagr.am",
     "youtube.com", "youtu.be",
     "twitter.com", "x.com", "t.co",
-    "facebook.com", "fb.watch",
+    "facebook.com", "fb.watch", "fb.com",
     "reddit.com", "redd.it",
     "twitch.tv",
     "vimeo.com",
@@ -561,7 +592,7 @@ async def _handle_update(
             "📦 <b>What you receive:</b>\n"
             "• <b>Videos</b> → sent as document (no Telegram compression)\n"
             "  + audio track extracted &amp; sent separately 🎵\n"
-            "• <b>TikTok Slideshows</b> → all photos as carousel\n"
+            "• <b>TikTok Slideshows / IG Carousels</b> → all photos as carousel\n"
             "  + background music sent separately 🎵\n"
             "• <b>Photos</b> → single photo or carousel\n\n"
             "━━━━━━━━━━━━━━━━\n"
@@ -579,9 +610,12 @@ async def _handle_update(
         ))
         return JSONResponse({"ok": True})
 
-    # ── Queue download ────────────────────────────────────────────────────────
-    await send_text(chat_id, "Downloading... ⏳ This may take a moment.")
-    background_tasks.add_task(process_url, chat_id, text)
+    # ── Queue download & Trigger Animation ────────────────────────────────────
+    msg_response = await send_text(chat_id, "⏳ <b>Initializing download...</b>")
+    status_msg_id = msg_response.get("result", {}).get("message_id")
+    
+    # Process url in background, passing the message ID so it can animate status updates
+    background_tasks.add_task(process_url, chat_id, status_msg_id, text)
 
     return JSONResponse({"ok": True})
 
