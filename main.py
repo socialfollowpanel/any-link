@@ -171,7 +171,7 @@ async def expand_tiktok_url(url: str) -> str:
 # =============================================================================
 
 async def download_url_to_file(url: str, dest: str, chat_id: int = None, msg_id: int = None) -> str:
-    """Stream-download a single URL to dest with animated progress bar."""
+    """Stream-download a single URL to dest with animated green progress bar."""
     async with httpx.AsyncClient(
         follow_redirects=True,
         timeout=60,
@@ -196,7 +196,7 @@ async def download_url_to_file(url: str, dest: str, chat_id: int = None, msg_id:
                         if now - last_update > 2.0:
                             pct = (downloaded / total) * 100
                             filled = int(pct / 10)
-                            bar = "█" * filled + "▒" * (10 - filled)
+                            bar = "🟩" * filled + "⬜" * (10 - filled)
                             asyncio.create_task(edit_message_text(
                                 chat_id, msg_id, 
                                 f"📥 <b>Downloading...</b>\n\n[{bar}] {pct:.1f}%"
@@ -268,14 +268,21 @@ async def handle_tiktok_fallback(chat_id: int, msg_id: int, url: str, prefix: st
         return [dest]
 
 
-# ── Universal Fallback API (Cobalt) for IG, FB, YT ──
+# ── Universal Fallback API for IG, FB, YT ──
 async def universal_platform_fallback(url: str, prefix: str, chat_id: int = None, msg_id: int = None) -> list[str]:
     """
-    Uses the Cobalt API as a fallback for Instagram (Reels/Posts/Carousels), 
-    Facebook, and YouTube to guarantee highest quality delivery.
+    Uses multiple free fallback APIs for Instagram (Reels/Posts/Carousels), 
+    Facebook, and YouTube to guarantee highest quality delivery if one fails.
     """
     logger.info("[fallback] universal API fetch for %s", url)
-    api_url = "https://api.cobalt.tools/api/json"
+    
+    # List of robust, free public instances to prevent failures
+    apis = [
+        "https://co.wuk.sh/api/json",
+        "https://cobalt.kwi.li/api/json",
+        "https://api.cobalt.tools/api/json"
+    ]
+    
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
@@ -287,13 +294,21 @@ async def universal_platform_fallback(url: str, prefix: str, chat_id: int = None
         "filenamePattern": "basic"
     }
     
-    async with httpx.AsyncClient(timeout=45) as client:
-        r = await client.post(api_url, json=payload, headers=headers)
-        r.raise_for_status()
-        data = r.json()
+    data = None
+    for api_url in apis:
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post(api_url, json=payload, headers=headers)
+                r.raise_for_status()
+                data = r.json()
+                if data.get("status") != "error":
+                    break # Success, exit the fallback loop
+        except Exception as e:
+            logger.warning(f"[fallback] API {api_url} failed: {e}")
+            continue
 
-    if data.get("status") == "error":
-        raise RuntimeError(data.get("text", "Fallback API returned an error"))
+    if not data or data.get("status") == "error":
+        raise RuntimeError(data.get("text", "All Fallback APIs returned an error"))
 
     paths = []
     
@@ -346,7 +361,7 @@ def build_yt_dlp_cmd(url: str, output_template: str) -> list[str]:
 
 
 async def run_yt_dlp_async(url: str, prefix: str, chat_id: int, msg_id: int) -> list[str]:
-    """Download via yt-dlp asynchronously and update Telegram progress bar."""
+    """Download via yt-dlp asynchronously and update Telegram green progress bar."""
     output_template = f"{TMP_DIR}/{prefix}_%(id)s.%(ext)s"
     cmd = build_yt_dlp_cmd(url, output_template)
     cmd.append("--newline")  # Force newlines so we can read progress line-by-line
@@ -379,7 +394,7 @@ async def run_yt_dlp_async(url: str, prefix: str, chat_id: int, msg_id: int) -> 
                 # Update animation every 2 seconds
                 if now - last_update > 2.0:
                     filled = int(pct / 10)
-                    bar = "█" * filled + "▒" * (10 - filled)
+                    bar = "🟩" * filled + "⬜" * (10 - filled)
                     asyncio.create_task(edit_message_text(
                         chat_id, msg_id, 
                         f"📥 <b>Downloading...</b>\n\n[{bar}] {pct:.1f}%"
@@ -448,13 +463,11 @@ async def process_url(chat_id: int, msg_id: int, url: str) -> None:
 
     try:
         # ── 1. Expand short TikTok links ──────────────────────────────────────
-        await edit_message_text(chat_id, msg_id, "🔍 <b>Analyzing URL...</b>")
         if is_tiktok_url(url):
             url = await expand_tiktok_url(url)
 
         # ── 2. Primary Downloader: yt-dlp ─────────────────────────────────────
         loop = asyncio.get_event_loop()
-        await edit_message_text(chat_id, msg_id, "📥 <b>Initializing download stream...</b>")
         
         try:
             # Enforce slideshows directly to fallback since yt-dlp handles carousels poorly
@@ -467,7 +480,6 @@ async def process_url(chat_id: int, msg_id: int, url: str) -> None:
         except RuntimeError as exc:
             err = str(exc).lower()
             logger.info(f"[dispatch] yt-dlp failed: {err}")
-            await edit_message_text(chat_id, msg_id, "⚠️ <b>yt-dlp failed, trying platform-specific fallback...</b>")
             
             # ── 3. Hybrid Fallback Routing ────────────────────────────────────
             try:
@@ -669,7 +681,8 @@ async def _handle_update(
         return JSONResponse({"ok": True})
 
     # ── Queue download & Trigger Animation ────────────────────────────────────
-    msg_response = await send_text(chat_id, "⏳ <b>Initializing download...</b>")
+    # Start immediately with the downloading animation at 0%
+    msg_response = await send_text(chat_id, "📥 <b>Downloading...</b>\n\n[⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜] 0.0%")
     status_msg_id = msg_response.get("result", {}).get("message_id")
     
     # Process url in background, passing the message ID so it can animate status updates
