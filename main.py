@@ -2,6 +2,7 @@ import os
 import re
 import glob
 import json
+import time
 import asyncio
 import subprocess
 import logging
@@ -169,8 +170,8 @@ async def expand_tiktok_url(url: str) -> str:
 # Downloader Core & Fallback APIs
 # =============================================================================
 
-async def download_url_to_file(url: str, dest: str) -> str:
-    """Stream-download a single URL to dest. Returns dest path."""
+async def download_url_to_file(url: str, dest: str, chat_id: int = None, msg_id: int = None) -> str:
+    """Stream-download a single URL to dest with animated progress bar."""
     async with httpx.AsyncClient(
         follow_redirects=True,
         timeout=60,
@@ -178,9 +179,29 @@ async def download_url_to_file(url: str, dest: str) -> str:
     ) as client:
         async with client.stream("GET", url) as r:
             r.raise_for_status()
+            
+            total_length = r.headers.get('Content-Length')
+            total = int(total_length) if total_length else None
+            downloaded = 0
+            last_update = time.time()
+            
             with open(dest, "wb") as f:
                 async for chunk in r.aiter_bytes(65536):
                     f.write(chunk)
+                    downloaded += len(chunk)
+                    
+                    if total and chat_id and msg_id:
+                        now = time.time()
+                        # Update animation every 2 seconds to avoid Telegram rate limits
+                        if now - last_update > 2.0:
+                            pct = (downloaded / total) * 100
+                            filled = int(pct / 10)
+                            bar = "█" * filled + "▒" * (10 - filled)
+                            asyncio.create_task(edit_message_text(
+                                chat_id, msg_id, 
+                                f"📥 <b>Downloading...</b>\n\n[{bar}] {pct:.1f}%"
+                            ))
+                            last_update = now
     return dest
 
 
@@ -200,7 +221,7 @@ async def tikwm_fetch(url: str) -> dict:
 
     return body["data"]
 
-async def handle_tiktok_fallback(chat_id: int, url: str, prefix: str) -> list[str]:
+async def handle_tiktok_fallback(chat_id: int, msg_id: int, url: str, prefix: str) -> list[str]:
     """Handles both TikTok videos and slideshows via tikwm."""
     logger.info("[fallback] tikwm fetch for %s", url)
     data = await tikwm_fetch(url)
@@ -243,12 +264,12 @@ async def handle_tiktok_fallback(chat_id: int, url: str, prefix: str) -> list[st
         if not play_url:
             raise RuntimeError("tikwm returned no video URL")
         dest = f"{TMP_DIR}/{prefix}_tiktok.mp4"
-        await download_url_to_file(play_url, dest)
+        await download_url_to_file(play_url, dest, chat_id, msg_id)
         return [dest]
 
 
 # ── Universal Fallback API (Cobalt) for IG, FB, YT ──
-async def universal_platform_fallback(url: str, prefix: str) -> list[str]:
+async def universal_platform_fallback(url: str, prefix: str, chat_id: int = None, msg_id: int = None) -> list[str]:
     """
     Uses the Cobalt API as a fallback for Instagram (Reels/Posts/Carousels), 
     Facebook, and YouTube to guarantee highest quality delivery.
@@ -297,7 +318,7 @@ async def universal_platform_fallback(url: str, prefix: str) -> list[str]:
         if not url_to_download:
             raise RuntimeError("No media URL returned from fallback")
         dest = f"{TMP_DIR}/{prefix}_fallback.mp4"
-        await download_url_to_file(url_to_download, dest)
+        await download_url_to_file(url_to_download, dest, chat_id, msg_id)
         paths.append(dest)
 
     return paths
@@ -324,17 +345,54 @@ def build_yt_dlp_cmd(url: str, output_template: str) -> list[str]:
     return cmd
 
 
-def run_yt_dlp(url: str, prefix: str) -> list[str]:
-    """Download via yt-dlp. Returns list of output file paths."""
+async def run_yt_dlp_async(url: str, prefix: str, chat_id: int, msg_id: int) -> list[str]:
+    """Download via yt-dlp asynchronously and update Telegram progress bar."""
     output_template = f"{TMP_DIR}/{prefix}_%(id)s.%(ext)s"
     cmd = build_yt_dlp_cmd(url, output_template)
-    logger.info("[yt-dlp] %s", " ".join(cmd))
+    cmd.append("--newline")  # Force newlines so we can read progress line-by-line
+    
+    logger.info("[yt-dlp async] %s", " ".join(cmd))
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    
+    last_update = time.time()
+    
+    # Read output line-by-line to animate progress
+    while True:
+        line = await process.stdout.readline()
+        if not line:
+            break
+            
+        line_str = line.decode('utf-8', errors='ignore')
+        
+        # Look for percentages like " 45.0% "
+        if "[download]" in line_str and "%" in line_str:
+            match = re.search(r'(\d+\.\d+)%', line_str)
+            if match:
+                pct = float(match.group(1))
+                now = time.time()
+                
+                # Update animation every 2 seconds
+                if now - last_update > 2.0:
+                    filled = int(pct / 10)
+                    bar = "█" * filled + "▒" * (10 - filled)
+                    asyncio.create_task(edit_message_text(
+                        chat_id, msg_id, 
+                        f"📥 <b>Downloading...</b>\n\n[{bar}] {pct:.1f}%"
+                    ))
+                    last_update = now
 
-    if result.returncode != 0:
-        logger.error("[yt-dlp] stderr: %s", result.stderr)
-        raise RuntimeError(result.stderr or "yt-dlp exited with error")
+    await process.wait()
+
+    if process.returncode != 0:
+        stderr_bytes = await process.stderr.read()
+        stderr_text = stderr_bytes.decode('utf-8', errors='ignore')
+        logger.error("[yt-dlp] stderr: %s", stderr_text)
+        raise RuntimeError(stderr_text or "yt-dlp exited with error")
 
     return sorted(glob.glob(f"{TMP_DIR}/{prefix}_*"))
 
@@ -396,14 +454,14 @@ async def process_url(chat_id: int, msg_id: int, url: str) -> None:
 
         # ── 2. Primary Downloader: yt-dlp ─────────────────────────────────────
         loop = asyncio.get_event_loop()
-        await edit_message_text(chat_id, msg_id, "📥 <b>Downloading media in highest quality...</b>")
+        await edit_message_text(chat_id, msg_id, "📥 <b>Initializing download stream...</b>")
         
         try:
             # Enforce slideshows directly to fallback since yt-dlp handles carousels poorly
             if is_tiktok_url(url) and is_tiktok_slideshow(url):
                 raise RuntimeError("TikTok Slideshow bypassed yt-dlp")
                 
-            files = await loop.run_in_executor(None, run_yt_dlp, url, prefix)
+            files = await run_yt_dlp_async(url, prefix, chat_id, msg_id)
             all_files = list(files)
             
         except RuntimeError as exc:
@@ -414,9 +472,9 @@ async def process_url(chat_id: int, msg_id: int, url: str) -> None:
             # ── 3. Hybrid Fallback Routing ────────────────────────────────────
             try:
                 if is_tiktok_url(url):
-                    all_files = await handle_tiktok_fallback(chat_id, url, prefix)
+                    all_files = await handle_tiktok_fallback(chat_id, msg_id, url, prefix)
                 elif is_instagram_url(url) or is_facebook_url(url) or is_youtube_url(url):
-                    all_files = await universal_platform_fallback(url, prefix)
+                    all_files = await universal_platform_fallback(url, prefix, chat_id, msg_id)
                 else:
                     if "private" in err or "login" in err:
                         await edit_message_text(chat_id, msg_id, "🔒 <b>This content is private or requires login.</b>")
