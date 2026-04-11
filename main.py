@@ -545,62 +545,108 @@ async def instagram_graphql_download(
     Returns True on success, False if shortcode can't be extracted.
     Raises RuntimeError on API / download failure.
     """
+    from urllib.parse import unquote
     shortcode = _extract_ig_shortcode(url)
     if not shortcode:
         return False
 
     logger.info("[ig-gql] shortcode=%s", shortcode)
 
-    headers = {
-        "User-Agent":        _CHROME_UA,
-        "X-IG-App-ID":       _IG_APP_ID,
-        "X-FB-LSD":          "AVqbxe3J_YA",
-        "X-ASBD-ID":         "129477",
-        "Content-Type":      "application/x-www-form-urlencoded",
-        "Accept":            "*/*",
-        "Referer":           "https://www.instagram.com/",
-        "Sec-Fetch-Site":    "same-origin",
-        "Sec-Fetch-Mode":    "cors",
-        "Origin":            "https://www.instagram.com",
-        **_ig_session_header(),
+    raw_session = os.environ.get("IG_SESSION_ID", "").strip()
+    session_id  = unquote(raw_session) if raw_session else ""
+
+    base_headers = {
+        "User-Agent":     _CHROME_UA,
+        "X-IG-App-ID":    _IG_APP_ID,
+        "Accept":         "*/*",
+        "Accept-Language":"en-US,en;q=0.9",
+        "Referer":        "https://www.instagram.com/",
+        "Origin":         "https://www.instagram.com",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
     }
+    if session_id:
+        base_headers["Cookie"] = f"sessionid={session_id}"
 
-    payload = (
-        f"variables=%7B%22shortcode%22%3A%22{shortcode}%22%7D"
-        f"&doc_id={_IG_DOC_ID}"
-        f"&lsd=AVqbxe3J_YA"
-    )
+    media = None
 
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
-        r = await c.post(
-            "https://www.instagram.com/api/graphql",
-            content=payload.encode(),
-            headers=headers,
-        )
-        r.raise_for_status()
-        data = r.json()
-
-    media = (data.get("data") or {}).get("xdt_shortcode_media")
-    if not media:
-        # Fallback: try older graphql/query endpoint
+    # ── Attempt 1: /api/graphql with doc_id (2025 active endpoint) ────────────
+    try:
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
-            r2 = await c.post(
-                "https://www.instagram.com/graphql/query",
-                content=(
-                    f"variables=%7B%22shortcode%22%3A%22{shortcode}%22%7D"
-                    f"&doc_id=24368985919464652"
-                ).encode(),
-                headers=headers,
+            r = await c.post(
+                "https://www.instagram.com/api/graphql",
+                data={
+                    "variables": json.dumps({"shortcode": shortcode}),
+                    "doc_id":    _IG_DOC_ID,
+                    "lsd":       "AVqbxe3J_YA",
+                },
+                headers={
+                    **base_headers,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "X-FB-LSD":     "AVqbxe3J_YA",
+                    "X-ASBD-ID":    "129477",
+                },
             )
-            r2.raise_for_status()
-            data2 = r2.json()
-        media = (
-            (data2.get("data") or {}).get("xdt_shortcode_media")
-            or (data2.get("data") or {}).get("shortcode_media")
-        )
+        body = r.text.strip()
+        logger.info("[ig-gql] attempt1 status=%s body_len=%d", r.status_code, len(body))
+        if body:
+            j = r.json()
+            media = (j.get("data") or {}).get("xdt_shortcode_media")
+    except Exception as e:
+        logger.warning("[ig-gql] attempt1 failed: %s", e)
+
+    # ── Attempt 2: older graphql/query endpoint ────────────────────────────────
+    if not media:
+        try:
+            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
+                r2 = await c.post(
+                    "https://www.instagram.com/graphql/query",
+                    data={
+                        "variables": json.dumps({"shortcode": shortcode}),
+                        "doc_id":    "24368985919464652",
+                    },
+                    headers={
+                        **base_headers,
+                        "Content-Type": "application/x-www-form-urlencoded",
+                    },
+                )
+            body2 = r2.text.strip()
+            logger.info("[ig-gql] attempt2 status=%s body_len=%d", r2.status_code, len(body2))
+            if body2:
+                j2 = r2.json()
+                media = (
+                    (j2.get("data") or {}).get("xdt_shortcode_media")
+                    or (j2.get("data") or {}).get("shortcode_media")
+                )
+        except Exception as e:
+            logger.warning("[ig-gql] attempt2 failed: %s", e)
+
+    # ── Attempt 3: oEmbed API (public, no auth, video URLs only) ─────────────
+    if not media:
+        try:
+            async with httpx.AsyncClient(timeout=15) as c:
+                r3 = await c.get(
+                    "https://api.instagram.com/oembed/",
+                    params={"url": url, "omitscript": "true"},
+                    headers=base_headers,
+                )
+            if r3.status_code == 200 and r3.text.strip():
+                j3 = r3.json()
+                thumb = j3.get("thumbnail_url", "")
+                logger.info("[ig-gql] oEmbed thumb=%s", thumb)
+                # oEmbed only gives thumbnail — raise so caller falls back to Cobalt
+                raise RuntimeError("oEmbed available but no direct media URL — try Cobalt")
+        except RuntimeError:
+            raise
+        except Exception as e:
+            logger.warning("[ig-gql] attempt3 oEmbed failed: %s", e)
 
     if not media:
-        raise RuntimeError("Instagram GraphQL returned no media data")
+        raise RuntimeError(
+            f"Instagram GraphQL returned no media for shortcode={shortcode}. "
+            "All 3 endpoints returned empty — session cookie may be required or expired."
+        )
 
     typename = media.get("__typename", "")
     all_files: list[str] = []
