@@ -502,72 +502,193 @@ def ensure_instagram_cookies() -> Optional[str]:
 
 
 # =============================================================================
-# LAYER 3 — yt-dlp (fallback)
+# Instagram GraphQL scraper
 # =============================================================================
+# yt-dlp cannot handle Instagram image/carousel posts — it only finds video
+# streams and crashes on photo posts. We use Instagram's internal GraphQL
+# API directly instead, which works for all post types.
 
-_IG_DOMAINS = ("instagram.com", "instagr.am")
-
-# Chrome UA that Instagram accepts
-_CHROME_UA = (
+_IG_DOMAINS  = ("instagram.com", "instagr.am")
+_IG_APP_ID   = "936619743392459"   # stable desktop web app ID
+_IG_DOC_ID   = "10015901848480474" # shortcode media query (2025)
+_CHROME_UA   = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
+import re as _re
+
+def _extract_ig_shortcode(url: str) -> Optional[str]:
+    """Extract shortcode from any Instagram post/reel/tv URL."""
+    m = _re.search(
+        r"instagram\.com/(?:[^/]+/)?(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)", url
+    )
+    return m.group(1) if m else None
+
+
+def _ig_session_header() -> dict:
+    """Return Cookie header with decoded session ID, or empty dict."""
+    from urllib.parse import unquote
+    raw = os.environ.get("IG_SESSION_ID", "").strip()
+    if not raw:
+        return {}
+    return {"Cookie": f"sessionid={unquote(raw)}"}
+
+
+async def instagram_graphql_download(
+    chat_id: int, url: str, prefix: str
+) -> bool:
+    """
+    Download any public Instagram post via GraphQL API.
+    Handles: single image, single video, carousel (mixed images+videos).
+    Returns True on success, False if shortcode can't be extracted.
+    Raises RuntimeError on API / download failure.
+    """
+    shortcode = _extract_ig_shortcode(url)
+    if not shortcode:
+        return False
+
+    logger.info("[ig-gql] shortcode=%s", shortcode)
+
+    headers = {
+        "User-Agent":        _CHROME_UA,
+        "X-IG-App-ID":       _IG_APP_ID,
+        "X-FB-LSD":          "AVqbxe3J_YA",
+        "X-ASBD-ID":         "129477",
+        "Content-Type":      "application/x-www-form-urlencoded",
+        "Accept":            "*/*",
+        "Referer":           "https://www.instagram.com/",
+        "Sec-Fetch-Site":    "same-origin",
+        "Sec-Fetch-Mode":    "cors",
+        "Origin":            "https://www.instagram.com",
+        **_ig_session_header(),
+    }
+
+    payload = (
+        f"variables=%7B%22shortcode%22%3A%22{shortcode}%22%7D"
+        f"&doc_id={_IG_DOC_ID}"
+        f"&lsd=AVqbxe3J_YA"
+    )
+
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
+        r = await c.post(
+            "https://www.instagram.com/api/graphql",
+            content=payload.encode(),
+            headers=headers,
+        )
+        r.raise_for_status()
+        data = r.json()
+
+    media = (data.get("data") or {}).get("xdt_shortcode_media")
+    if not media:
+        # Fallback: try older graphql/query endpoint
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
+            r2 = await c.post(
+                "https://www.instagram.com/graphql/query",
+                content=(
+                    f"variables=%7B%22shortcode%22%3A%22{shortcode}%22%7D"
+                    f"&doc_id=24368985919464652"
+                ).encode(),
+                headers=headers,
+            )
+            r2.raise_for_status()
+            data2 = r2.json()
+        media = (
+            (data2.get("data") or {}).get("xdt_shortcode_media")
+            or (data2.get("data") or {}).get("shortcode_media")
+        )
+
+    if not media:
+        raise RuntimeError("Instagram GraphQL returned no media data")
+
+    typename = media.get("__typename", "")
+    all_files: list[str] = []
+
+    try:
+        # ── Carousel (mixed images + videos) ──────────────────────────────────
+        if typename == "XDTGraphSidecar" or "edge_sidecar_to_children" in media:
+            edges = (media.get("edge_sidecar_to_children") or {}).get("edges", [])
+            items = [e["node"] for e in edges if e.get("node")]
+            logger.info("[ig-gql] carousel with %d items", len(items))
+
+            photo_paths: list[str] = []
+            for i, node in enumerate(items):
+                is_vid = node.get("is_video", False)
+                if is_vid:
+                    vid_url = node.get("video_url", "")
+                    dest = f"{TMP_DIR}/{prefix}_ig_{i:02d}.mp4"
+                    await stream_download(vid_url, dest)
+                    all_files.append(dest)
+                    await send_document(
+                        chat_id, dest,
+                        caption=f"🎬 <b>Video {i+1}/{len(items)}</b>"
+                    )
+                    audio = await _extract_audio(dest, f"{prefix}_ig_{i}")
+                    if audio:
+                        all_files.append(audio)
+                        await send_audio(chat_id, audio, caption="🎵 <b>Audio track</b>")
+                else:
+                    img_url = node.get("display_url", "")
+                    dest = f"{TMP_DIR}/{prefix}_ig_{i:02d}.jpg"
+                    await stream_download(img_url, dest)
+                    all_files.append(dest)
+                    photo_paths.append(dest)
+
+            # Send all photos as media group
+            if len(photo_paths) == 1:
+                await send_photo(chat_id, photo_paths[0])
+            elif photo_paths:
+                for start in range(0, len(photo_paths), 10):
+                    await send_media_group(chat_id, photo_paths[start:start+10])
+
+        # ── Single video (Reel / video post) ──────────────────────────────────
+        elif media.get("is_video"):
+            vid_url = media.get("video_url", "")
+            dest = f"{TMP_DIR}/{prefix}_ig_video.mp4"
+            await stream_download(vid_url, dest)
+            all_files.append(dest)
+            await send_document(
+                chat_id, dest,
+                caption="🎬 <b>Video</b> — original quality"
+            )
+            audio = await _extract_audio(dest, f"{prefix}_ig")
+            if audio:
+                all_files.append(audio)
+                await send_audio(chat_id, audio, caption="🎵 <b>Audio track</b>")
+
+        # ── Single image ──────────────────────────────────────────────────────
+        else:
+            img_url = media.get("display_url", "")
+            dest = f"{TMP_DIR}/{prefix}_ig_photo.jpg"
+            await stream_download(img_url, dest)
+            all_files.append(dest)
+            await send_photo(chat_id, dest)
+
+    finally:
+        cleanup(all_files)
+
+    return True
+
 def run_yt_dlp(url: str, prefix: str) -> list[str]:
     """
     Run yt-dlp with smart per-platform options.
-    - Instagram: no forced format (handles images, videos, carousels)
     - Everything else: bestvideo+bestaudio/best
     Raises RuntimeError on failure.
     """
     output_template = f"{TMP_DIR}/{prefix}_%(id)s.%(ext)s"
-    is_instagram = any(d in url for d in _IG_DOMAINS)
 
-    cmd = ["python", "-m", "yt_dlp"]
-
-    if is_instagram:
-        # Do NOT force -f bestvideo+bestaudio — Instagram posts can be
-        # images or carousels with no video stream at all.
-        # Let yt-dlp pick the best available format automatically.
-        cmd += [
-            "--no-playlist",
-            "--no-warnings",
-            "--socket-timeout", "30",
-            "-o", output_template,
-        ]
-
-        # Session cookie
-        cookies_path = ensure_instagram_cookies()
-        if cookies_path:
-            cmd += ["--cookies", cookies_path]
-            logger.info("[yt-dlp] Instagram: using session cookie")
-        else:
-            logger.warning("[yt-dlp] Instagram: no IG_SESSION_ID — likely to fail")
-
-        # Full browser header set Instagram validates
-        cmd += [
-            "--add-headers", f"User-Agent:{_CHROME_UA}",
-            "--add-headers", "Accept:text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "--add-headers", "Accept-Language:en-US,en;q=0.9",
-            "--add-headers", "Sec-Fetch-Mode:navigate",
-            "--add-headers", "Sec-Fetch-Site:none",
-            "--add-headers", "Sec-Fetch-Dest:document",
-            "--add-headers", "Referer:https://www.instagram.com/",
-        ]
-
-    else:
-        # All other platforms — force highest quality video+audio
-        cmd += [
-            "-f", "bestvideo+bestaudio/best",
-            "--merge-output-format", "mp4",
-            "--no-playlist",
-            "--no-warnings",
-            "--socket-timeout", "30",
-            "-o", output_template,
-        ]
-
-    cmd.append(url)
+    # All platforms (Instagram is handled by GraphQL scraper above, not here)
+    cmd = [
+        "python", "-m", "yt_dlp",
+        "-f", "bestvideo+bestaudio/best",
+        "--merge-output-format", "mp4",
+        "--no-playlist",
+        "--no-warnings",
+        "--socket-timeout", "30",
+        "-o", output_template,
+        url,
+    ]
 
     logger.info("[yt-dlp] running for %s", url)
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
@@ -651,7 +772,19 @@ async def process_url(chat_id: int, url: str) -> None:
             await handle_tiktok_slideshow(chat_id, url, prefix)
             return
 
-        # ── Step 3: Cobalt API ─────────────────────────────────────────────────
+        # ── Step 3: Instagram → direct GraphQL (handles all post types) ─────────
+        if any(d in url for d in _IG_DOMAINS):
+            logger.info("[dispatch] Instagram → GraphQL scraper")
+            try:
+                ok = await instagram_graphql_download(chat_id, url, prefix)
+                if ok:
+                    return
+                # shortcode not found — fall through to Cobalt/yt-dlp
+            except RuntimeError as exc:
+                logger.warning("[dispatch] Instagram GraphQL failed: %s", exc)
+                # Fall through to Cobalt then yt-dlp
+
+        # ── Step 4: Cobalt API ─────────────────────────────────────────────────
         logger.info("[dispatch] Trying Cobalt for %s", url)
         cobalt_ok = await handle_cobalt(chat_id, url, prefix)
         if cobalt_ok:
