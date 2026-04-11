@@ -8,6 +8,13 @@ Download pipeline (in priority order):
                                          Facebook, Reddit, TikTok videos,
                                          Twitch, Pinterest, SoundCloud …)
   3. Cobalt fallback   → yt-dlp         (any URL Cobalt can't handle)
+     • Instagram URLs: injects IG_SESSION_ID cookie automatically
+     • All other URLs: standard yt-dlp best quality
+
+Instagram note (2025):
+  Instagram now blocks all anonymous requests. You MUST set IG_SESSION_ID
+  in your Vercel environment variables to download Instagram content.
+  How to get it: instagram.com → DevTools → Application → Cookies → sessionid
 
 After every video download, audio is extracted and sent separately.
 Short TikTok links are always expanded before processing.
@@ -448,25 +455,94 @@ async def handle_cobalt(chat_id: int, url: str, prefix: str) -> bool:
 
 
 # =============================================================================
+# Instagram cookies helper
+# =============================================================================
+
+# Instagram now blocks all anonymous requests (2025).
+# Set IG_SESSION_ID in your Vercel env vars to a real Instagram sessionid cookie.
+# How to get it: open instagram.com in browser → DevTools → Application →
+# Cookies → copy the value of "sessionid"
+
+COOKIES_FILE = f"{TMP_DIR}/ig_cookies.txt"
+_cookies_written = False
+
+def ensure_instagram_cookies() -> Optional[str]:
+    """
+    Write a Netscape-format cookies.txt file from IG_SESSION_ID env var.
+    Returns the path to the cookies file, or None if env var not set.
+    """
+    global _cookies_written
+    session_id = os.environ.get("IG_SESSION_ID", "").strip()
+    if not session_id:
+        return None
+
+    if not _cookies_written or not os.path.exists(COOKIES_FILE):
+        content = (
+            "# Netscape HTTP Cookie File\n"
+            ".instagram.com\tTRUE\t/\tTRUE\t2147483647\tsessionid\t" + session_id + "\n"
+            "www.instagram.com\tTRUE\t/\tTRUE\t2147483647\tsessionid\t" + session_id + "\n"
+        )
+        with open(COOKIES_FILE, "w") as f:
+            f.write(content)
+        _cookies_written = True
+        logger.info("[cookies] Instagram cookies.txt written")
+
+    return COOKIES_FILE
+
+
+# =============================================================================
 # LAYER 3 — yt-dlp (fallback)
 # =============================================================================
 
+_IG_DOMAINS = ("instagram.com", "instagr.am")
+
 def run_yt_dlp(url: str, prefix: str) -> list[str]:
-    """Run yt-dlp. Raises RuntimeError on failure."""
+    """
+    Run yt-dlp with smart per-platform options.
+    - Instagram: injects session cookies + browser User-Agent
+    - Everything else: standard best quality
+    Raises RuntimeError on failure.
+    """
     output_template = f"{TMP_DIR}/{prefix}_%(id)s.%(ext)s"
+
     cmd = [
         "python", "-m", "yt_dlp",
         "-f", "bestvideo+bestaudio/best",
         "--merge-output-format", "mp4",
         "--no-playlist", "--no-warnings",
         "--socket-timeout", "30",
-        "-o", output_template, url,
+        "-o", output_template,
     ]
-    logger.info("[yt-dlp] %s", " ".join(cmd))
+
+    # ── Instagram-specific options ────────────────────────────────────────────
+    if any(d in url for d in _IG_DOMAINS):
+        # Spoof a real Chrome browser — Instagram checks UA
+        cmd += [
+            "--add-headers",
+            "User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36",
+        ]
+        # Inject session cookie if available
+        cookies_path = ensure_instagram_cookies()
+        if cookies_path:
+            cmd += ["--cookies", cookies_path]
+            logger.info("[yt-dlp] Using Instagram cookies")
+        else:
+            logger.warning(
+                "[yt-dlp] No IG_SESSION_ID set — Instagram may block the request. "
+                "Add IG_SESSION_ID to your Vercel env vars."
+            )
+
+    cmd.append(url)
+
+    logger.info("[yt-dlp] running for %s", url)
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+
     if result.returncode != 0:
         logger.error("[yt-dlp] stderr: %s", result.stderr)
         raise RuntimeError(result.stderr or "yt-dlp error")
+
     return sorted(glob.glob(f"{TMP_DIR}/{prefix}_*"))
 
 
@@ -563,14 +639,42 @@ async def process_url(chat_id: int, url: str) -> None:
         try:
             files = await loop.run_in_executor(None, run_yt_dlp, url, prefix)
         except RuntimeError as exc:
-            err = str(exc)
-            if "private" in err.lower() or "login" in err.lower():
-                await send_text(chat_id, "This content is private or requires login 🔒")
+            err = str(exc).lower()
+            is_instagram = any(d in url for d in _IG_DOMAINS)
+
+            if "private" in err and not ("login" in err or "rate" in err):
+                # Genuinely private post
+                await send_text(chat_id, "🔒 This content is private and cannot be downloaded.")
+            elif is_instagram and ("login" in err or "rate" in err or "not available" in err):
+                # Instagram blocked us — guide user on the cookie fix
+                has_cookie = bool(os.environ.get("IG_SESSION_ID", "").strip())
+                if not has_cookie:
+                    await send_text(
+                        chat_id,
+                        "⚠️ <b>Instagram is blocking anonymous downloads.</b>\n\n"
+                        "This is a known Instagram restriction in 2025.\n"
+                        "The bot admin needs to add an <code>IG_SESSION_ID</code> "
+                        "cookie to the Vercel environment variables.\n\n"
+                        "See /help for more info."
+                    )
+                else:
+                    await send_text(
+                        chat_id,
+                        "⚠️ <b>Instagram download failed.</b>\n\n"
+                        "Instagram may have rate-limited or expired the session cookie.\n"
+                        "Please try again in a few minutes, or the admin may need to "
+                        "refresh the <code>IG_SESSION_ID</code> cookie."
+                    )
+            elif "unsupported url" in err:
+                await send_text(
+                    chat_id,
+                    "❌ This URL is not supported.\n"
+                    "Make sure it's a direct link to a public post or video."
+                )
             else:
                 await send_text(
                     chat_id,
-                    "❌ Could not download this content.\n"
-                    "Make sure the URL is public and supported."
+                    "❌ Download failed. Make sure the link is public and try again."
                 )
             return
 
