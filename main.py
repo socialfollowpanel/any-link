@@ -483,22 +483,19 @@ def ensure_instagram_cookies() -> Optional[str]:
     session_id = unquote(raw)
     logger.info("[cookies] Instagram sessionid (decoded length=%d)", len(session_id))
 
-    # Always re-write — /tmp is ephemeral on Vercel, so we can't trust it persists
+    # Always re-write — /tmp is ephemeral on Vercel between cold starts
+    # STRICT Netscape format rules:
+    #   - File MUST start with "# Netscape HTTP Cookie File"
+    #   - Domain MUST start with a dot (.) for domain_specified == initial_dot
+    #   - www.instagram.com (no dot) causes AssertionError in Python's cookiejar
     expiry = "2147483647"
-    lines = [
-        "# Netscape HTTP Cookie File\n",
-        # Root domain  (covers all subdomains)
-        f".instagram.com\tTRUE\t/\tTRUE\t{expiry}\tsessionid\t{session_id}\n",
-        f"www.instagram.com\tTRUE\t/\tTRUE\t{expiry}\tsessionid\t{session_id}\n",
-        # csrftoken placeholder — yt-dlp sometimes checks for it
-        f".instagram.com\tTRUE\t/\tTRUE\t{expiry}\tcsrftoken\tplaceholder\n",
-        f"www.instagram.com\tTRUE\t/\tTRUE\t{expiry}\tcsrftoken\tplaceholder\n",
-        # ds_user_id — Instagram session companion cookie
-        f".instagram.com\tTRUE\t/\tTRUE\t{expiry}\tds_user_id\t0\n",
-    ]
+    content = (
+        "# Netscape HTTP Cookie File\n"
+        f".instagram.com\tTRUE\t/\tTRUE\t{expiry}\tsessionid\t{session_id}\n"
+    )
 
     with open(COOKIES_FILE, "w") as f:
-        f.writelines(lines)
+        f.write(content)
 
     logger.info("[cookies] Written %s", COOKIES_FILE)
     return COOKIES_FILE
