@@ -462,31 +462,45 @@ async def handle_cobalt(chat_id: int, url: str, prefix: str) -> bool:
 # Set IG_SESSION_ID in your Vercel env vars to a real Instagram sessionid cookie.
 # How to get it: open instagram.com in browser → DevTools → Application →
 # Cookies → copy the value of "sessionid"
+#
+# The value may be URL-encoded (contains %3A etc.) — we decode it automatically.
 
 COOKIES_FILE = f"{TMP_DIR}/ig_cookies.txt"
-_cookies_written = False
 
 def ensure_instagram_cookies() -> Optional[str]:
     """
     Write a Netscape-format cookies.txt file from IG_SESSION_ID env var.
+    URL-decodes the value automatically (handles %3A → : etc.)
     Returns the path to the cookies file, or None if env var not set.
     """
-    global _cookies_written
-    session_id = os.environ.get("IG_SESSION_ID", "").strip()
-    if not session_id:
+    from urllib.parse import unquote
+
+    raw = os.environ.get("IG_SESSION_ID", "").strip()
+    if not raw:
         return None
 
-    if not _cookies_written or not os.path.exists(COOKIES_FILE):
-        content = (
-            "# Netscape HTTP Cookie File\n"
-            ".instagram.com\tTRUE\t/\tTRUE\t2147483647\tsessionid\t" + session_id + "\n"
-            "www.instagram.com\tTRUE\t/\tTRUE\t2147483647\tsessionid\t" + session_id + "\n"
-        )
-        with open(COOKIES_FILE, "w") as f:
-            f.write(content)
-        _cookies_written = True
-        logger.info("[cookies] Instagram cookies.txt written")
+    # Decode URL-encoding — e.g. 56481615479%3Azm18... → 56481615479:zm18...
+    session_id = unquote(raw)
+    logger.info("[cookies] Instagram sessionid (decoded length=%d)", len(session_id))
 
+    # Always re-write — /tmp is ephemeral on Vercel, so we can't trust it persists
+    expiry = "2147483647"
+    lines = [
+        "# Netscape HTTP Cookie File\n",
+        # Root domain  (covers all subdomains)
+        f".instagram.com\tTRUE\t/\tTRUE\t{expiry}\tsessionid\t{session_id}\n",
+        f"www.instagram.com\tTRUE\t/\tTRUE\t{expiry}\tsessionid\t{session_id}\n",
+        # csrftoken placeholder — yt-dlp sometimes checks for it
+        f".instagram.com\tTRUE\t/\tTRUE\t{expiry}\tcsrftoken\tplaceholder\n",
+        f"www.instagram.com\tTRUE\t/\tTRUE\t{expiry}\tcsrftoken\tplaceholder\n",
+        # ds_user_id — Instagram session companion cookie
+        f".instagram.com\tTRUE\t/\tTRUE\t{expiry}\tds_user_id\t0\n",
+    ]
+
+    with open(COOKIES_FILE, "w") as f:
+        f.writelines(lines)
+
+    logger.info("[cookies] Written %s", COOKIES_FILE)
     return COOKIES_FILE
 
 
@@ -496,10 +510,17 @@ def ensure_instagram_cookies() -> Optional[str]:
 
 _IG_DOMAINS = ("instagram.com", "instagr.am")
 
+# Chrome UA that Instagram accepts
+_CHROME_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
 def run_yt_dlp(url: str, prefix: str) -> list[str]:
     """
     Run yt-dlp with smart per-platform options.
-    - Instagram: injects session cookies + browser User-Agent
+    - Instagram: injects session cookies + full browser headers
     - Everything else: standard best quality
     Raises RuntimeError on failure.
     """
@@ -516,23 +537,24 @@ def run_yt_dlp(url: str, prefix: str) -> list[str]:
 
     # ── Instagram-specific options ────────────────────────────────────────────
     if any(d in url for d in _IG_DOMAINS):
-        # Spoof a real Chrome browser — Instagram checks UA
-        cmd += [
-            "--add-headers",
-            "User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36",
-        ]
-        # Inject session cookie if available
         cookies_path = ensure_instagram_cookies()
+
         if cookies_path:
             cmd += ["--cookies", cookies_path]
-            logger.info("[yt-dlp] Using Instagram cookies")
+            logger.info("[yt-dlp] Instagram: using session cookie")
         else:
-            logger.warning(
-                "[yt-dlp] No IG_SESSION_ID set — Instagram may block the request. "
-                "Add IG_SESSION_ID to your Vercel env vars."
-            )
+            logger.warning("[yt-dlp] Instagram: no IG_SESSION_ID — likely to fail")
+
+        # Full browser header set — Instagram checks all of these
+        cmd += [
+            "--add-headers", f"User-Agent:{_CHROME_UA}",
+            "--add-headers", "Accept:text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "--add-headers", "Accept-Language:en-US,en;q=0.9",
+            "--add-headers", "Sec-Fetch-Mode:navigate",
+            "--add-headers", "Sec-Fetch-Site:none",
+            "--add-headers", "Sec-Fetch-Dest:document",
+            "--add-headers", "Referer:https://www.instagram.com/",
+        ]
 
     cmd.append(url)
 
