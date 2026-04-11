@@ -517,32 +517,35 @@ _CHROME_UA = (
 def run_yt_dlp(url: str, prefix: str) -> list[str]:
     """
     Run yt-dlp with smart per-platform options.
-    - Instagram: injects session cookies + full browser headers
-    - Everything else: standard best quality
+    - Instagram: no forced format (handles images, videos, carousels)
+    - Everything else: bestvideo+bestaudio/best
     Raises RuntimeError on failure.
     """
     output_template = f"{TMP_DIR}/{prefix}_%(id)s.%(ext)s"
+    is_instagram = any(d in url for d in _IG_DOMAINS)
 
-    cmd = [
-        "python", "-m", "yt_dlp",
-        "-f", "bestvideo+bestaudio/best",
-        "--merge-output-format", "mp4",
-        "--no-playlist", "--no-warnings",
-        "--socket-timeout", "30",
-        "-o", output_template,
-    ]
+    cmd = ["python", "-m", "yt_dlp"]
 
-    # ── Instagram-specific options ────────────────────────────────────────────
-    if any(d in url for d in _IG_DOMAINS):
+    if is_instagram:
+        # Do NOT force -f bestvideo+bestaudio — Instagram posts can be
+        # images or carousels with no video stream at all.
+        # Let yt-dlp pick the best available format automatically.
+        cmd += [
+            "--no-playlist",
+            "--no-warnings",
+            "--socket-timeout", "30",
+            "-o", output_template,
+        ]
+
+        # Session cookie
         cookies_path = ensure_instagram_cookies()
-
         if cookies_path:
             cmd += ["--cookies", cookies_path]
             logger.info("[yt-dlp] Instagram: using session cookie")
         else:
             logger.warning("[yt-dlp] Instagram: no IG_SESSION_ID — likely to fail")
 
-        # Full browser header set — Instagram checks all of these
+        # Full browser header set Instagram validates
         cmd += [
             "--add-headers", f"User-Agent:{_CHROME_UA}",
             "--add-headers", "Accept:text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -551,6 +554,17 @@ def run_yt_dlp(url: str, prefix: str) -> list[str]:
             "--add-headers", "Sec-Fetch-Site:none",
             "--add-headers", "Sec-Fetch-Dest:document",
             "--add-headers", "Referer:https://www.instagram.com/",
+        ]
+
+    else:
+        # All other platforms — force highest quality video+audio
+        cmd += [
+            "-f", "bestvideo+bestaudio/best",
+            "--merge-output-format", "mp4",
+            "--no-playlist",
+            "--no-warnings",
+            "--socket-timeout", "30",
+            "-o", output_template,
         ]
 
     cmd.append(url)
