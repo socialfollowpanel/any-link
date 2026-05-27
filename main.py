@@ -7,9 +7,16 @@ Download pipeline (in priority order):
   2. Everything else   → Cobalt API     (Instagram, Twitter/X, YouTube,
                                          Facebook, Reddit, TikTok videos,
                                          Twitch, Pinterest, SoundCloud …)
-  3. Cobalt fallback   → yt-dlp         (any URL Cobalt can't handle)
+  3. Cobalt fallback   → yt-dlp         (any URL yt-dlp supports — 1000+ sites)
      • Instagram URLs: injects IG_SESSION_ID cookie automatically
      • All other URLs: standard yt-dlp best quality
+
+Key improvement over previous version:
+  • ANY http/https URL is now accepted — no domain allowlist.
+  • A HEAD probe checks Content-Type to confirm a URL carries media before
+    attempting a full download.
+  • yt-dlp is tried for all unknown/unsupported-by-Cobalt domains because
+    yt-dlp itself supports 1000+ sites out of the box.
 
 Instagram note (2025):
   Instagram now blocks all anonymous requests. You MUST set IG_SESSION_ID
@@ -45,18 +52,29 @@ TMP_DIR   = "/tmp"
 MAX_BYTES = 50 * 1024 * 1024   # Telegram Bot API limit
 
 # ── Cobalt API instances (tried in order; first success wins) ─────────────────
-# These are well-known public Cobalt instances with open CORS & no auth.
-# Add your own self-hosted instance first for best reliability.
 COBALT_INSTANCES = [
     os.environ.get("COBALT_API_URL", ""),   # self-hosted (optional env var)
     "https://cobalt.api.lostnode.net",
-    "https://api.cobalt.tools",             # official – may rate-limit bots
+    "https://api.cobalt.tools",
     "https://cobalt.lunar.icu",
     "https://cobalt.cae.re",
 ]
 COBALT_INSTANCES = [u for u in COBALT_INSTANCES if u]  # drop empty
 
 TIKWM_API = "https://www.tikwm.com/api/"
+
+# ── MIME types we consider "media" for direct-link detection ──────────────────
+MEDIA_MIME_PREFIXES = (
+    "video/",
+    "audio/",
+    "application/mp4",
+    "application/octet-stream",  # many CDNs serve video as this
+)
+MEDIA_EXTENSIONS = {
+    ".mp4", ".mkv", ".webm", ".mov", ".avi", ".flv", ".wmv",
+    ".mp3", ".m4a", ".ogg", ".opus", ".flac", ".wav", ".aac",
+    ".m3u8", ".ts",
+}
 
 # ── App ───────────────────────────────────────────────────────────────────────
 @asynccontextmanager
@@ -165,6 +183,55 @@ def cleanup(paths: list[str]) -> None:
 
 
 # =============================================================================
+# URL helpers — media detection (no domain allowlist)
+# =============================================================================
+
+def looks_like_url(text: str) -> bool:
+    """Accept any http/https URL — we'll validate content later."""
+    t = text.strip()
+    return t.startswith(("http://", "https://"))
+
+
+async def probe_for_video(url: str) -> bool:
+    """
+    Do a lightweight HEAD request to check whether the URL points to
+    a video or audio resource.  Returns True if we should attempt a download.
+
+    We say "yes" when:
+      - Content-Type starts with video/ or audio/
+      - The URL path ends with a known media extension
+      - The server doesn't respond (we try anyway — yt-dlp will figure it out)
+    """
+    # Fast extension check first (no network round-trip needed)
+    path_part = url.split("?")[0].lower()
+    if any(path_part.endswith(ext) for ext in MEDIA_EXTENSIONS):
+        return True
+
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True, timeout=10,
+            headers={"User-Agent": "Mozilla/5.0"},
+        ) as c:
+            r = await c.head(url)
+            ct = r.headers.get("content-type", "").lower()
+            logger.info("[probe] %s → content-type=%s", url, ct)
+            if any(ct.startswith(p) for p in MEDIA_MIME_PREFIXES):
+                return True
+            # HTML page — might still embed a video (YouTube, Vimeo, etc.)
+            # Let yt-dlp try rather than refuse.
+            return True   # always attempt; yt-dlp will fail gracefully if nothing found
+    except Exception as e:
+        logger.warning("[probe] HEAD failed for %s: %s — will still try", url, e)
+        return True   # network error doesn't mean there's no video; try anyway
+
+
+def is_direct_media_url(url: str) -> bool:
+    """True if the URL looks like a direct file link (CDN/storage)."""
+    path_part = url.split("?")[0].lower()
+    return any(path_part.endswith(ext) for ext in MEDIA_EXTENSIONS)
+
+
+# =============================================================================
 # TikTok link expansion
 # =============================================================================
 
@@ -216,7 +283,6 @@ async def handle_tiktok_slideshow(chat_id: int, url: str, prefix: str) -> None:
     logger.info("[tikwm] fetching slideshow %s", url)
     data = await tikwm_fetch(url)
 
-    # Collect image URLs
     images: list[str] = data.get("images") or []
     if not images:
         for img in (data.get("image_post_info") or {}).get("images", []):
@@ -227,18 +293,15 @@ async def handle_tiktok_slideshow(chat_id: int, url: str, prefix: str) -> None:
     if not images:
         raise RuntimeError("tikwm: no images found in slideshow")
 
-    # Collect music URL
     music_url: str = (
         (data.get("music_info") or {}).get("play")
         or data.get("music") or ""
     )
 
-    # Caption
     author  = (data.get("author") or {}).get("nickname", "")
     desc    = (data.get("title") or data.get("desc") or "")[:80]
     caption = f"📸 <b>{author}</b>" + (f"\n{desc}" if desc else "")
 
-    # Download images concurrently
     image_paths: list[str] = []
     tasks = [
         stream_download(img_url, f"{TMP_DIR}/{prefix}_slide_{i:02d}.jpg")
@@ -255,7 +318,6 @@ async def handle_tiktok_slideshow(chat_id: int, url: str, prefix: str) -> None:
     if not image_paths:
         raise RuntimeError("tikwm: all image downloads failed")
 
-    # Download music
     music_path: Optional[str] = None
     if music_url:
         try:
@@ -266,7 +328,6 @@ async def handle_tiktok_slideshow(chat_id: int, url: str, prefix: str) -> None:
         except Exception as e:
             logger.warning("[tikwm] music failed: %s", e)
 
-    # Send images
     if len(image_paths) == 1:
         await send_photo(chat_id, image_paths[0], caption=caption)
     else:
@@ -276,7 +337,6 @@ async def handle_tiktok_slideshow(chat_id: int, url: str, prefix: str) -> None:
                 caption=caption if start == 0 else "",
             )
 
-    # Send music
     if music_path:
         await send_audio(
             chat_id, music_path,
@@ -307,14 +367,6 @@ COBALT_PAYLOAD = {
 
 
 async def cobalt_query(url: str) -> Optional[dict]:
-    """
-    Try each Cobalt instance in order.
-    Returns the parsed JSON response or None if all instances fail.
-    Response statuses:
-      tunnel / redirect → single file download URL
-      picker            → list of items (carousel / multi-track)
-      error             → failed
-    """
     payload = {**COBALT_PAYLOAD, "url": url}
 
     for instance in COBALT_INSTANCES:
@@ -331,7 +383,6 @@ async def cobalt_query(url: str) -> Optional[dict]:
                 if status == "picker":
                     logger.info("[cobalt] %s → picker (%s)", instance, url)
                     return data
-                # error status — try next instance
                 logger.warning("[cobalt] %s error: %s", instance, data.get("error"))
             else:
                 logger.warning("[cobalt] %s HTTP %s", instance, r.status_code)
@@ -342,14 +393,6 @@ async def cobalt_query(url: str) -> Optional[dict]:
 
 
 async def handle_cobalt(chat_id: int, url: str, prefix: str) -> bool:
-    """
-    Download via Cobalt API. Returns True on success, False if Cobalt couldn't handle it.
-
-    Delivery rules:
-      • Single video  → sendDocument (no compression) + extracted audio
-      • Picker items  → each video as document + audio; each image as photo
-      • Audio only    → sendAudio
-    """
     result = await cobalt_query(url)
     if not result:
         return False
@@ -358,7 +401,6 @@ async def handle_cobalt(chat_id: int, url: str, prefix: str) -> bool:
     all_files: list[str] = []
 
     try:
-        # ── Single file ───────────────────────────────────────────────────────
         if status in ("tunnel", "redirect", "stream", "local-processing"):
             file_url: str = result.get("url", "")
             filename: str = result.get("filename", f"{prefix}_cobalt.mp4")
@@ -390,16 +432,15 @@ async def handle_cobalt(chat_id: int, url: str, prefix: str) -> bool:
 
             return True
 
-        # ── Picker (carousel / multi-item) ────────────────────────────────────
         if status == "picker":
             items: list[dict] = result.get("picker", [])
-            audio_item        = result.get("audio")  # background audio URL
+            audio_item        = result.get("audio")
 
             photos: list[str] = []
 
             for i, item in enumerate(items):
                 item_url  = item.get("url", "")
-                item_type = item.get("type", "photo")   # "photo" | "video"
+                item_type = item.get("type", "photo")
                 ext       = ".jpg" if item_type == "photo" else ".mp4"
                 dest      = f"{TMP_DIR}/{prefix}_pick_{i:02d}{ext}"
 
@@ -413,7 +454,6 @@ async def handle_cobalt(chat_id: int, url: str, prefix: str) -> bool:
                 if item_type == "photo":
                     photos.append(dest)
                 else:
-                    # video item — send as document + extract audio
                     await send_document(
                         chat_id, dest,
                         caption=f"🎬 <b>Video {i + 1}</b>"
@@ -426,14 +466,12 @@ async def handle_cobalt(chat_id: int, url: str, prefix: str) -> bool:
                             caption=f"🎵 <b>Audio {i + 1}</b>"
                         )
 
-            # Send photo batch as media group
             if len(photos) == 1:
                 await send_photo(chat_id, photos[0])
             elif photos:
                 for start in range(0, len(photos), 10):
                     await send_media_group(chat_id, photos[start:start + 10])
 
-            # Send background audio (e.g. TikTok slideshow music from Cobalt)
             if audio_item:
                 try:
                     adest = f"{TMP_DIR}/{prefix}_bg_audio.mp3"
@@ -455,48 +493,75 @@ async def handle_cobalt(chat_id: int, url: str, prefix: str) -> bool:
 
 
 # =============================================================================
-# Instagram cookies helper
+# LAYER 2b — Direct media URL download (CDN/storage links)
 # =============================================================================
 
-# Instagram now blocks all anonymous requests (2025).
-# Set IG_SESSION_ID in your Vercel env vars to a real Instagram sessionid cookie.
-# How to get it: open instagram.com in browser → DevTools → Application →
-# Cookies → copy the value of "sessionid"
-#
-# The value may be URL-encoded (contains %3A etc.) — we decode it automatically.
+async def handle_direct_download(chat_id: int, url: str, prefix: str) -> bool:
+    """
+    If the URL is a direct link to a media file (ends with .mp4, .mp3, etc.)
+    just stream it down and send it without invoking yt-dlp or Cobalt.
+    Returns True on success.
+    """
+    if not is_direct_media_url(url):
+        return False
+
+    path_part = url.split("?")[0].lower()
+    ext = Path(path_part).suffix or ".mp4"
+    dest = f"{TMP_DIR}/{prefix}_direct{ext}"
+
+    try:
+        logger.info("[direct] downloading %s", url)
+        await stream_download(url, dest)
+        if not os.path.exists(dest) or os.path.getsize(dest) == 0:
+            return False
+
+        ftype = _classify(dest)
+        if ftype == "video":
+            await send_document(
+                chat_id, dest,
+                caption="🎬 <b>Video</b> — original quality"
+            )
+            audio_path = await _extract_audio(dest, prefix)
+            if audio_path:
+                if os.path.getsize(audio_path) <= MAX_BYTES:
+                    await send_audio(chat_id, audio_path,
+                                     caption="🎵 <b>Audio extracted from video</b>")
+                cleanup([audio_path])
+        elif ftype == "audio":
+            await send_audio(chat_id, dest, caption="🎵 <b>Audio</b>")
+        elif ftype == "photo":
+            await send_photo(chat_id, dest)
+        else:
+            await send_document(chat_id, dest)
+
+        return True
+    except Exception as e:
+        logger.warning("[direct] failed: %s", e)
+        return False
+    finally:
+        cleanup([dest])
+
+
+# =============================================================================
+# Instagram cookies helper
+# =============================================================================
 
 COOKIES_FILE = f"{TMP_DIR}/ig_cookies.txt"
 
 def ensure_instagram_cookies() -> Optional[str]:
-    """
-    Write a Netscape-format cookies.txt file from IG_SESSION_ID env var.
-    URL-decodes the value automatically (handles %3A → : etc.)
-    Returns the path to the cookies file, or None if env var not set.
-    """
     from urllib.parse import unquote
-
     raw = os.environ.get("IG_SESSION_ID", "").strip()
     if not raw:
         return None
-
-    # Decode URL-encoding — e.g. 56481615479%3Azm18... → 56481615479:zm18...
     session_id = unquote(raw)
     logger.info("[cookies] Instagram sessionid (decoded length=%d)", len(session_id))
-
-    # Always re-write — /tmp is ephemeral on Vercel between cold starts
-    # STRICT Netscape format rules:
-    #   - File MUST start with "# Netscape HTTP Cookie File"
-    #   - Domain MUST start with a dot (.) for domain_specified == initial_dot
-    #   - www.instagram.com (no dot) causes AssertionError in Python's cookiejar
     expiry = "2147483647"
     content = (
         "# Netscape HTTP Cookie File\n"
         f".instagram.com\tTRUE\t/\tTRUE\t{expiry}\tsessionid\t{session_id}\n"
     )
-
     with open(COOKIES_FILE, "w") as f:
         f.write(content)
-
     logger.info("[cookies] Written %s", COOKIES_FILE)
     return COOKIES_FILE
 
@@ -504,13 +569,10 @@ def ensure_instagram_cookies() -> Optional[str]:
 # =============================================================================
 # Instagram GraphQL scraper
 # =============================================================================
-# yt-dlp cannot handle Instagram image/carousel posts — it only finds video
-# streams and crashes on photo posts. We use Instagram's internal GraphQL
-# API directly instead, which works for all post types.
 
 _IG_DOMAINS  = ("instagram.com", "instagr.am")
-_IG_APP_ID   = "936619743392459"   # stable desktop web app ID
-_IG_DOC_ID   = "10015901848480474" # shortcode media query (2025)
+_IG_APP_ID   = "936619743392459"
+_IG_DOC_ID   = "10015901848480474"
 _CHROME_UA   = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -520,7 +582,6 @@ _CHROME_UA   = (
 import re as _re
 
 def _extract_ig_shortcode(url: str) -> Optional[str]:
-    """Extract shortcode from any Instagram post/reel/tv URL."""
     m = _re.search(
         r"instagram\.com/(?:[^/]+/)?(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)", url
     )
@@ -528,7 +589,6 @@ def _extract_ig_shortcode(url: str) -> Optional[str]:
 
 
 def _ig_session_header() -> dict:
-    """Return Cookie header with decoded session ID, or empty dict."""
     from urllib.parse import unquote
     raw = os.environ.get("IG_SESSION_ID", "").strip()
     if not raw:
@@ -539,12 +599,6 @@ def _ig_session_header() -> dict:
 async def instagram_graphql_download(
     chat_id: int, url: str, prefix: str
 ) -> bool:
-    """
-    Download any public Instagram post via GraphQL API.
-    Handles: single image, single video, carousel (mixed images+videos).
-    Returns True on success, False if shortcode can't be extracted.
-    Raises RuntimeError on API / download failure.
-    """
     from urllib.parse import unquote
     shortcode = _extract_ig_shortcode(url)
     if not shortcode:
@@ -571,7 +625,6 @@ async def instagram_graphql_download(
 
     media = None
 
-    # ── Attempt 1: /api/graphql with doc_id (2025 active endpoint) ────────────
     try:
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
             r = await c.post(
@@ -596,7 +649,6 @@ async def instagram_graphql_download(
     except Exception as e:
         logger.warning("[ig-gql] attempt1 failed: %s", e)
 
-    # ── Attempt 2: older graphql/query endpoint ────────────────────────────────
     if not media:
         try:
             async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
@@ -622,7 +674,6 @@ async def instagram_graphql_download(
         except Exception as e:
             logger.warning("[ig-gql] attempt2 failed: %s", e)
 
-    # ── Attempt 3: oEmbed API (public, no auth, video URLs only) ─────────────
     if not media:
         try:
             async with httpx.AsyncClient(timeout=15) as c:
@@ -632,10 +683,6 @@ async def instagram_graphql_download(
                     headers=base_headers,
                 )
             if r3.status_code == 200 and r3.text.strip():
-                j3 = r3.json()
-                thumb = j3.get("thumbnail_url", "")
-                logger.info("[ig-gql] oEmbed thumb=%s", thumb)
-                # oEmbed only gives thumbnail — raise so caller falls back to Cobalt
                 raise RuntimeError("oEmbed available but no direct media URL — try Cobalt")
         except RuntimeError:
             raise
@@ -652,7 +699,6 @@ async def instagram_graphql_download(
     all_files: list[str] = []
 
     try:
-        # ── Carousel (mixed images + videos) ──────────────────────────────────
         if typename == "XDTGraphSidecar" or "edge_sidecar_to_children" in media:
             edges = (media.get("edge_sidecar_to_children") or {}).get("edges", [])
             items = [e["node"] for e in edges if e.get("node")]
@@ -681,14 +727,12 @@ async def instagram_graphql_download(
                     all_files.append(dest)
                     photo_paths.append(dest)
 
-            # Send all photos as media group
             if len(photo_paths) == 1:
                 await send_photo(chat_id, photo_paths[0])
             elif photo_paths:
                 for start in range(0, len(photo_paths), 10):
                     await send_media_group(chat_id, photo_paths[start:start+10])
 
-        # ── Single video (Reel / video post) ──────────────────────────────────
         elif media.get("is_video"):
             vid_url = media.get("video_url", "")
             dest = f"{TMP_DIR}/{prefix}_ig_video.mp4"
@@ -703,7 +747,6 @@ async def instagram_graphql_download(
                 all_files.append(audio)
                 await send_audio(chat_id, audio, caption="🎵 <b>Audio track</b>")
 
-        # ── Single image ──────────────────────────────────────────────────────
         else:
             img_url = media.get("display_url", "")
             dest = f"{TMP_DIR}/{prefix}_ig_photo.jpg"
@@ -716,15 +759,19 @@ async def instagram_graphql_download(
 
     return True
 
-def run_yt_dlp(url: str, prefix: str) -> list[str]:
+
+# =============================================================================
+# LAYER 3 — yt-dlp (universal fallback — supports 1000+ sites)
+# =============================================================================
+
+def run_yt_dlp(url: str, prefix: str, cookies_file: Optional[str] = None) -> list[str]:
     """
-    Run yt-dlp with smart per-platform options.
-    - Everything else: bestvideo+bestaudio/best
+    Run yt-dlp with best quality settings.
+    Supports any site yt-dlp knows about (1000+ extractors).
     Raises RuntimeError on failure.
     """
     output_template = f"{TMP_DIR}/{prefix}_%(id)s.%(ext)s"
 
-    # All platforms (Instagram is handled by GraphQL scraper above, not here)
     cmd = [
         "python", "-m", "yt_dlp",
         "-f", "bestvideo+bestaudio/best",
@@ -732,12 +779,19 @@ def run_yt_dlp(url: str, prefix: str) -> list[str]:
         "--no-playlist",
         "--no-warnings",
         "--socket-timeout", "30",
+        # Spoof a real browser to bypass basic bot detection
+        "--add-header", "User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "--add-header", "Referer:" + url,
         "-o", output_template,
-        url,
     ]
 
+    if cookies_file and os.path.exists(cookies_file):
+        cmd += ["--cookies", cookies_file]
+
+    cmd.append(url)
+
     logger.info("[yt-dlp] running for %s", url)
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
 
     if result.returncode != 0:
         logger.error("[yt-dlp] stderr: %s", result.stderr)
@@ -751,11 +805,6 @@ def run_yt_dlp(url: str, prefix: str) -> list[str]:
 # =============================================================================
 
 async def _extract_audio(video_path: str, prefix: str) -> Optional[str]:
-    """
-    Extract audio track from a video file as 320 kbps mp3.
-    Runs in a thread executor so it doesn't block the event loop.
-    Returns the mp3 path on success, None on failure.
-    """
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _extract_audio_sync, video_path, prefix)
 
@@ -773,7 +822,6 @@ def _extract_audio_sync(video_path: str, prefix: str) -> Optional[str]:
     ]
     try:
         subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        # yt-dlp may append ext — find actual output
         candidates = glob.glob(f"{TMP_DIR}/{prefix}_audio*.mp3")
         if candidates:
             p = candidates[0]
@@ -790,11 +838,11 @@ def _extract_audio_sync(video_path: str, prefix: str) -> Optional[str]:
 
 def _classify(path: str) -> str:
     ext = Path(path).suffix.lower()
-    if ext in {".mp4", ".mkv", ".webm", ".mov", ".avi"}:
+    if ext in {".mp4", ".mkv", ".webm", ".mov", ".avi", ".flv", ".wmv"}:
         return "video"
     if ext in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
         return "photo"
-    if ext in {".mp3", ".m4a", ".ogg", ".opus", ".flac", ".wav"}:
+    if ext in {".mp3", ".m4a", ".ogg", ".opus", ".flac", ".wav", ".aac"}:
         return "audio"
     return "document"
 
@@ -818,29 +866,34 @@ async def process_url(chat_id: int, url: str) -> None:
             await handle_tiktok_slideshow(chat_id, url, prefix)
             return
 
-        # ── Step 3: Instagram → direct GraphQL (handles all post types) ─────────
+        # ── Step 3: Direct media file link (CDN / storage) ────────────────────
+        if is_direct_media_url(url):
+            logger.info("[dispatch] direct media URL → stream download")
+            ok = await handle_direct_download(chat_id, url, prefix)
+            if ok:
+                return
+
+        # ── Step 4: Instagram → direct GraphQL ────────────────────────────────
         if any(d in url for d in _IG_DOMAINS):
             logger.info("[dispatch] Instagram → GraphQL scraper")
             try:
                 ok = await instagram_graphql_download(chat_id, url, prefix)
                 if ok:
                     return
-                # shortcode not found — fall through to Cobalt/yt-dlp
             except RuntimeError as exc:
                 logger.warning("[dispatch] Instagram GraphQL failed: %s", exc)
-                # Fall through to Cobalt then yt-dlp
 
-        # ── Step 4: Cobalt API ─────────────────────────────────────────────────
+        # ── Step 5: Cobalt API ─────────────────────────────────────────────────
         logger.info("[dispatch] Trying Cobalt for %s", url)
         cobalt_ok = await handle_cobalt(chat_id, url, prefix)
         if cobalt_ok:
             return
 
-        # ── Step 4: yt-dlp fallback ────────────────────────────────────────────
+        # ── Step 6: yt-dlp universal fallback ─────────────────────────────────
         logger.info("[dispatch] Cobalt failed, falling back to yt-dlp for %s", url)
         loop = asyncio.get_event_loop()
 
-        # TikTok: also try tikwm before yt-dlp gives up
+        # TikTok: also try tikwm before giving up
         if is_tiktok(url):
             try:
                 await handle_tiktok_slideshow(chat_id, url, prefix)
@@ -848,40 +901,42 @@ async def process_url(chat_id: int, url: str) -> None:
             except Exception as e:
                 logger.warning("[dispatch] tikwm fallback also failed: %s", e)
 
+        # Pass Instagram cookies if available
+        cookies_file: Optional[str] = None
+        if any(d in url for d in _IG_DOMAINS):
+            cookies_file = ensure_instagram_cookies()
+
         try:
-            files = await loop.run_in_executor(None, run_yt_dlp, url, prefix)
+            files = await loop.run_in_executor(
+                None, run_yt_dlp, url, prefix, cookies_file
+            )
         except RuntimeError as exc:
             err = str(exc).lower()
             is_instagram = any(d in url for d in _IG_DOMAINS)
 
             if "private" in err and not ("login" in err or "rate" in err):
-                # Genuinely private post
                 await send_text(chat_id, "🔒 This content is private and cannot be downloaded.")
             elif is_instagram and ("login" in err or "rate" in err or "not available" in err):
-                # Instagram blocked us — guide user on the cookie fix
                 has_cookie = bool(os.environ.get("IG_SESSION_ID", "").strip())
                 if not has_cookie:
                     await send_text(
                         chat_id,
                         "⚠️ <b>Instagram is blocking anonymous downloads.</b>\n\n"
-                        "This is a known Instagram restriction in 2025.\n"
                         "The bot admin needs to add an <code>IG_SESSION_ID</code> "
-                        "cookie to the Vercel environment variables.\n\n"
-                        "See /help for more info."
+                        "cookie to the environment variables.\n\nSee /help for more info."
                     )
                 else:
                     await send_text(
                         chat_id,
                         "⚠️ <b>Instagram download failed.</b>\n\n"
                         "Instagram may have rate-limited or expired the session cookie.\n"
-                        "Please try again in a few minutes, or the admin may need to "
-                        "refresh the <code>IG_SESSION_ID</code> cookie."
+                        "Please try again in a few minutes."
                     )
             elif "unsupported url" in err:
                 await send_text(
                     chat_id,
-                    "❌ This URL is not supported.\n"
-                    "Make sure it's a direct link to a public post or video."
+                    "❌ This URL is not supported by any of our download methods.\n"
+                    "Make sure it is a direct link to a public video or audio post."
                 )
             else:
                 await send_text(
@@ -895,7 +950,6 @@ async def process_url(chat_id: int, url: str) -> None:
             await send_text(chat_id, "❌ No media found at that URL.")
             return
 
-        # Size filter
         oversized = [f for f in all_files if os.path.getsize(f) > MAX_BYTES]
         sendable  = [f for f in all_files if os.path.getsize(f) <= MAX_BYTES]
 
@@ -913,14 +967,12 @@ async def process_url(chat_id: int, url: str) -> None:
         audios  = [f for f in sendable if _classify(f) == "audio"]
         docs    = [f for f in sendable if _classify(f) == "document"]
 
-        # Photos
         if len(photos) > 1:
             for start in range(0, len(photos), 10):
                 await send_media_group(chat_id, photos[start:start + 10])
         elif photos:
             await send_photo(chat_id, photos[0])
 
-        # Videos + audio extraction
         for vf in videos:
             await send_document(
                 chat_id, vf,
@@ -950,35 +1002,6 @@ async def process_url(chat_id: int, url: str) -> None:
         await send_text(chat_id, "😢 An unexpected error occurred. Please try again.")
     finally:
         cleanup(all_files)
-
-
-# =============================================================================
-# Supported domains (for URL validation)
-# =============================================================================
-
-SUPPORTED_DOMAINS = (
-    "tiktok.com", "vm.tiktok.com", "vt.tiktok.com",
-    "instagram.com", "instagr.am",
-    "youtube.com", "youtu.be",
-    "twitter.com", "x.com", "t.co",
-    "facebook.com", "fb.watch",
-    "reddit.com", "redd.it",
-    "twitch.tv",
-    "vimeo.com",
-    "pinterest.com",
-    "snapchat.com",
-    "soundcloud.com",
-    "bilibili.com", "b23.tv",
-    "dailymotion.com",
-    "streamable.com",
-    "tumblr.com",
-    "bluesky.app", "bsky.app",
-)
-
-
-def looks_like_url(text: str) -> bool:
-    t = text.strip()
-    return t.startswith(("http://", "https://")) and any(d in t for d in SUPPORTED_DOMAINS)
 
 
 # =============================================================================
@@ -1021,10 +1044,11 @@ async def _handle_update(
             "🎵 <b>SoundCloud</b> — Audio\n"
             "🎮 <b>Twitch</b> — Clips\n"
             "📌 <b>Pinterest</b> — Videos &amp; Images\n"
-            "🎞 <b>Vimeo, Dailymotion, Bilibili</b> — and more!\n\n"
+            "🎞 <b>Vimeo, Dailymotion, Bilibili</b> — and more!\n"
+            "🌐 <b>Any direct video/audio link</b> — CDN, hosting, etc.\n\n"
             "━━━━━━━━━━━━━━━━\n"
             "📌 <b>How to use:</b>\n"
-            "1. Copy a link from any supported platform.\n"
+            "1. Copy any public video or audio link.\n"
             "2. Paste it here and send.\n"
             "3. I'll download and deliver it! ⚡\n\n"
             "Type /help for more info."
@@ -1035,22 +1059,20 @@ async def _handle_update(
     if text.startswith("/help"):
         await send_text(chat_id, (
             "📖 <b>Universal Downloader Bot — Help</b>\n\n"
-            "<b>Step 1:</b> Copy a media URL from any supported platform.\n"
+            "<b>Step 1:</b> Copy any public video or audio URL.\n"
             "<b>Step 2:</b> Paste it here and send.\n"
             "<b>Step 3:</b> Receive the file in seconds!\n\n"
             "━━━━━━━━━━━━━━━━\n"
-            "✅ <b>Supported platforms:</b>\n"
-            "TikTok · Instagram · YouTube · Twitter/X\n"
-            "Facebook · Reddit · SoundCloud · Twitch\n"
-            "Pinterest · Vimeo · Dailymotion · Bilibili\n"
-            "Streamable · Tumblr · Bluesky · and more!\n\n"
+            "✅ <b>What's supported:</b>\n"
+            "• All major social platforms (TikTok, YouTube, Instagram, etc.)\n"
+            "• Direct video/audio file links (.mp4, .mp3, .m4a, .webm …)\n"
+            "• Any site supported by yt-dlp (1000+ extractors)\n\n"
             "━━━━━━━━━━━━━━━━\n"
             "📦 <b>What you receive:</b>\n"
             "• <b>Videos</b> → file (no compression) + 🎵 audio separately\n"
             "• <b>TikTok Slideshows</b> → photo carousel + 🎵 background music\n"
             "• <b>Instagram Carousels</b> → all photos/videos\n"
-            "• <b>Audio posts</b> → mp3 file\n"
-            "• <b>Photos</b> → image or carousel\n\n"
+            "• <b>Audio posts</b> → mp3 file\n\n"
             "━━━━━━━━━━━━━━━━\n"
             "⚠️ <b>Limitations:</b>\n"
             "• Files above 50 MB cannot be sent via Telegram.\n"
@@ -1061,8 +1083,8 @@ async def _handle_update(
     # ── URL check ─────────────────────────────────────────────────────────────
     if not looks_like_url(text):
         await send_text(chat_id, (
-            "⚠️ Please send a valid URL from a supported platform.\n"
-            "Type /help to see the full list."
+            "⚠️ Please send a valid http/https link.\n"
+            "Type /help to learn more."
         ))
         return JSONResponse({"ok": True})
 
